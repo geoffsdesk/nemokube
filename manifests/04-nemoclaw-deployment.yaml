@@ -1,0 +1,195 @@
+# NemoKube Sandbox + OpenShell Gateway
+# Runs the NemoClaw sandbox container with OpenClaw agent and the
+# OpenShell gateway that routes inference to the NIM service.
+#
+# This is a StatefulSet so each replica gets stable identity and storage.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nemokube
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/name: nemokube
+    app.kubernetes.io/part-of: nemokube
+    app.kubernetes.io/component: sandbox
+spec:
+  serviceName: nemokube-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nemokube
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nemokube
+        app.kubernetes.io/part-of: nemokube
+        app.kubernetes.io/component: sandbox
+    spec:
+      # Runs on CPU system pool (inference is offloaded to NIM pods)
+      initContainers:
+        # Build the NemoKube sandbox image from the repo's Dockerfile,
+        # then configure OpenClaw + OpenShell to point at the in-cluster NIM.
+        - name: setup
+          image: nemoclaw-sandbox:latest  # Built from repo Dockerfile (see README)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              echo "Configuring NemoKube for in-cluster NIM inference..."
+
+              # Write OpenClaw config pointing inference at the K8s NIM service
+              python3 - <<'PYSETUP'
+              import json, os
+              home = os.environ.get('HOME', '/sandbox')
+              config_path = os.path.join(home, '.openclaw', 'openclaw.json')
+              os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+              nim_endpoint = os.environ.get('NIM_ENDPOINT', 'http://nim-service.nemokube.svc.cluster.local:8000/v1')
+              model = os.environ.get('INFERENCE_MODEL', 'nvidia/nemotron-3-super-120b-a12b')
+
+              cfg = {
+                  'agents': {'defaults': {'model': {'primary': model}}},
+                  'models': {'mode': 'merge', 'providers': {'nim-local': {
+                      'baseUrl': nim_endpoint,
+                      'apiKey': os.environ.get('NVIDIA_API_KEY', 'nim-local'),
+                      'api': 'openai-completions',
+                      'models': [{
+                          'id': model.split('/')[-1],
+                          'name': model,
+                          'reasoning': False,
+                          'input': ['text'],
+                          'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
+                          'contextWindow': 131072,
+                          'maxTokens': 8192,
+                      }]
+                  }}},
+                  'gateway': {
+                      'mode': 'local',
+                      'controlUi': {
+                          'allowInsecureAuth': True,
+                          'dangerouslyDisableDeviceAuth': True,
+                          'allowedOrigins': ['http://127.0.0.1:18789'],
+                      },
+                      'trustedProxies': ['127.0.0.1', '::1'],
+                  },
+              }
+
+              with open(config_path, 'w') as f:
+                  json.dump(cfg, f, indent=2)
+              os.chmod(config_path, 0o600)
+              print(f"Wrote OpenClaw config to {config_path}")
+              PYSETUP
+
+              echo "Init complete."
+          env:
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nemokube-secrets
+                  key: NVIDIA_API_KEY
+            - name: NIM_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: nemokube-config
+                  key: NIM_ENDPOINT
+            - name: INFERENCE_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: nemokube-config
+                  key: INFERENCE_MODEL
+          volumeMounts:
+            - name: sandbox-data
+              mountPath: /sandbox
+
+      containers:
+        - name: nemokube-sandbox
+          image: nemoclaw-sandbox:latest  # Built from repo Dockerfile
+          command: ["/usr/local/bin/nemoclaw-start"]
+          ports:
+            - name: dashboard
+              containerPort: 18789
+              protocol: TCP
+          env:
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nemokube-secrets
+                  key: NVIDIA_API_KEY
+            - name: CHAT_UI_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: nemokube-config
+                  key: CHAT_UI_URL
+            - name: PUBLIC_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: nemokube-config
+                  key: PUBLIC_PORT
+            - name: NIM_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: nemokube-config
+                  key: NIM_ENDPOINT
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: sandbox-data
+              mountPath: /sandbox
+          readinessProbe:
+            tcpSocket:
+              port: dashboard
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: dashboard
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+      volumes:
+        - name: sandbox-data
+          emptyDir:
+            sizeLimit: 10Gi
+---
+# Headless service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: nemokube-headless
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/name: nemokube
+    app.kubernetes.io/part-of: nemokube
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: nemokube
+  ports:
+    - name: dashboard
+      port: 18789
+      targetPort: dashboard
+---
+# ClusterIP service for accessing the NemoKube dashboard
+apiVersion: v1
+kind: Service
+metadata:
+  name: nemokube-dashboard
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/name: nemokube
+    app.kubernetes.io/part-of: nemokube
+    app.kubernetes.io/component: dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nemokube
+  ports:
+    - name: http
+      port: 80
+      targetPort: dashboard
+      protocol: TCP

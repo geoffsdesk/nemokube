@@ -1,0 +1,66 @@
+# Kubernetes NetworkPolicies for NemoKube
+# These mirror the sandbox security model from openclaw-sandbox.yaml
+# but enforce at the cluster networking layer.
+
+# NIM inference pods: only accept traffic from NemoKube sandbox pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nim-inference-ingress
+  namespace: nemokube
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nim-inference
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nemokube
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# NemoKube sandbox: allow dashboard access + egress to NIM and required APIs
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nemokube-sandbox-policy
+  namespace: nemokube
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nemokube
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow dashboard access from within the cluster
+    - ports:
+        - protocol: TCP
+          port: 18789
+  egress:
+    # DNS resolution
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NIM inference service (in-cluster)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nim-inference
+      ports:
+        - protocol: TCP
+          port: 8000
+    # NVIDIA cloud APIs (for API key auth and fallback)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

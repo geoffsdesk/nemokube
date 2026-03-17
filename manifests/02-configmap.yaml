@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemokube-config
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/part-of: nemokube
+data:
+  # Inference profile: "default" (NVIDIA cloud), "nim-local" (NIM on GPU), "vllm" (vLLM on GPU)
+  INFERENCE_PROFILE: "nim-local"
+  # Model to use
+  INFERENCE_MODEL: "nvidia/nemotron-3-nano-30b-a3b"
+  # NIM service endpoint (K8s service DNS)
+  NIM_ENDPOINT: "http://nim-service.nemokube.svc.cluster.local:8000/v1"
+  # Dashboard port forwarded from sandbox
+  PUBLIC_PORT: "18789"
+  # Chat UI origin (set to your Ingress/LoadBalancer URL if externally exposed)
+  CHAT_UI_URL: "http://127.0.0.1:18789"

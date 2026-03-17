@@ -1,0 +1,131 @@
+# NVIDIA NIM Inference Microservice — runs the Nemotron model on L4 GPU.
+# This is the local inference backend that NemoClaw routes to via the
+# "nim-local" profile in blueprint.yaml.
+#
+# The NIM container pulls the model on first start (~5-10 min for 120B).
+# Subsequent starts use the PVC-cached model weights.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nim-inference
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/name: nim-inference
+    app.kubernetes.io/part-of: nemokube
+    app.kubernetes.io/component: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nim-inference
+  strategy:
+    type: Recreate  # GPU workloads can't share — recreate on update
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nim-inference
+        app.kubernetes.io/part-of: nemokube
+        app.kubernetes.io/component: inference
+    spec:
+      # Schedule on L4 GPU nodes only
+      nodeSelector:
+        gpu-type: nvidia-l4
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: nim
+          # NIM container for Nemotron — pulls from NVIDIA NGC
+          # See: https://build.nvidia.com for available NIM images
+          image: nvcr.io/nim/nvidia/nemotron-3-nano-30b-a3b:latest
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nemokube-secrets
+                  key: NVIDIA_API_KEY
+            # NIM configuration
+            - name: NIM_MAX_MODEL_LEN
+              value: "16384"
+            - name: NIM_GPU_MEMORY_UTILIZATION
+              value: "0.85"
+            - name: NIM_TENSOR_PARALLEL_SIZE
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "24Gi"
+              nvidia.com/gpu: "1"
+          # Model weights cached on PVC to avoid re-download
+          volumeMounts:
+            - name: model-cache
+              mountPath: /opt/nim/.cache
+          # Health checks — NIM exposes OpenAI-compatible endpoints
+          startupProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60  # Up to 10 min for model loading
+          readinessProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: nim-model-cache
+---
+# PVC for caching downloaded model weights (survives pod restarts)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nim-model-cache
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/part-of: nemokube
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: premium-rwo  # SSD-backed on GKE
+  resources:
+    requests:
+      storage: 80Gi  # Nemotron nano 30B model weights
+---
+# Service exposing NIM to other pods in the namespace
+apiVersion: v1
+kind: Service
+metadata:
+  name: nim-service
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/name: nim-inference
+    app.kubernetes.io/part-of: nemokube
+    app.kubernetes.io/component: inference
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nim-inference
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
