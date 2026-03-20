@@ -1,8 +1,76 @@
 # NemoKube
 
-One-command deployment of [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) on Google Kubernetes Engine with capacity-aware GPU provisioning via NVIDIA NIM.
+One-command deployment of [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) on Google Cloud with NIM inference. Two deployment options: **Cloud Run** (serverless, scale-to-zero) or **GKE** (Kubernetes, always-on).
+
+> **Disclaimer:** This is a personal project. It is not supported, endorsed, or affiliated with Google or NVIDIA. Written against NemoClaw alpha (GTC 2026) — the project is maintained informally and may not reflect the latest releases.
+
+## Choose Your Deployment
+
+| | Cloud Run | GKE |
+|---|---|---|
+| **Best for** | Dev/test, intermittent use | Production, always-on |
+| **Idle cost** | $0 (scales to zero) | ~$330/mo |
+| **Cold start** | 30-120s (model loading) | None |
+| **Setup** | 2 gcloud commands | Cluster + NAP + ComputeClass |
+| **GPU quota** | Auto-granted (no request) | Must request manually |
+| **GPU options** | L4 only | L4, A100, H100 |
+| **Script** | `deploy-cloudrun.sh` | `deploy.sh` |
+
+## Quick Start: Cloud Run (Recommended for Testing)
+
+```bash
+export GCP_PROJECT="your-gcp-project-id"
+export NVIDIA_API_KEY="nvapi-your-key-here"
+chmod +x deploy-cloudrun.sh && ./deploy-cloudrun.sh
+```
+
+That's it. Two Cloud Run services deploy: NIM inference with an L4 GPU, and the NemoClaw gateway on CPU. Both scale to zero when idle. You get a public HTTPS URL — no kubectl port-forward needed.
+
+**Estimated cost:** ~$0/hr idle, ~$1.65/hr active.
+
+### Cleanup
+
+```bash
+./destroy-cloudrun.sh
+# or manually:
+gcloud run services delete nim-inference --region=$REGION --project=$GCP_PROJECT -q
+gcloud run services delete nemokube-gateway --region=$REGION --project=$GCP_PROJECT -q
+```
+
+## Quick Start: GKE (Full Kubernetes)
+
+```bash
+export GCP_PROJECT="your-gcp-project-id"
+export NVIDIA_API_KEY="nvapi-your-key-here"
+chmod +x deploy.sh && ./deploy.sh
+```
+
+Creates a regional GKE cluster with Node Auto-Provisioning, deploys NIM on a GPU node via ComputeClass, and launches the NemoClaw agent sandbox. The script walks you through model selection and checks GPU availability across zones.
+
+**Estimated cost:** ~$330/mo on-demand, ~$190/mo with Spot VMs.
+
+### Cleanup
+
+```bash
+./destroy-gke.sh
+# or manually:
+gcloud container clusters delete nemokube-cluster --region=$GKE_REGION --project=$GCP_PROJECT -q
+```
 
 ## Architecture
+
+### Cloud Run
+
+```
+┌────────────────────────────┐     ┌────────────────────────────┐
+│  nemokube-gateway          │     │  nim-inference              │
+│  (CPU, scale-to-zero)      │────▶│  (L4 GPU, scale-to-zero)   │
+│  OpenClaw Agent + Dashboard │     │  NIM + Llama 3.1 8B        │
+│  Public HTTPS URL           │     │  Internal (IAM-gated)      │
+└────────────────────────────┘     └────────────────────────────┘
+```
+
+### GKE
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -28,34 +96,24 @@ One-command deployment of [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) 
 ## Prerequisites
 
 - **gcloud CLI** installed and authenticated
-- **kubectl** installed
 - **Docker** installed locally
 - **NVIDIA API key** from [build.nvidia.com](https://build.nvidia.com) (must accept model license)
-- GCP project with billing enabled and GPU quota > 0
-
-## Quick Start
-
-```bash
-export GCP_PROJECT="your-gcp-project-id"
-export NVIDIA_API_KEY="nvapi-your-key-here"
-chmod +x deploy.sh && ./deploy.sh
-```
-
-The script walks you through model selection, checks GPU availability across zones, creates a regional GKE cluster with Node Auto-Provisioning, and deploys everything. No more manual zone-hunting for GPUs.
-
-## What's Different: Capacity-Aware Provisioning
-
-Previous versions used zonal clusters, which locked you into a single zone. If that zone had no GPU capacity, you were stuck deleting and recreating infrastructure. NemoKube v2 fixes this with three changes:
-
-**Pre-flight check (Step 2)** scans all zones in your region for the required GPU type before creating anything. If no zones have capacity, it tells you immediately and suggests alternative regions. No more "create and pray."
-
-**Regional cluster (Step 3)** spans multiple zones. The control plane is highly available and node pools can be created in any zone within the region.
-
-**ComputeClass + NAP (Step 5)** defines your GPU requirements as a declarative resource. GKE's Node Auto-Provisioning evaluates real-time capacity across zones and automatically creates a node pool wherever GPUs are available. If Spot is enabled, it tries Spot first and falls back to on-demand.
+- GCP project with billing enabled
+- **kubectl** (GKE only)
+- GPU quota > 0 (GKE only — Cloud Run auto-grants L4 quota)
 
 ## Model Selection
 
-The deploy script includes an interactive model selection wizard:
+### Cloud Run (L4 GPU only)
+
+```
+  #  Model                    CPU   Memory   GPU    Est. Cost
+  ─  ────────────────────     ───   ──────   ────   ──────────
+  1  Llama 3.1 8B (rec.)     8     32 GiB   L4     ~$1.65/hr
+  2  Llama 3.1 8B (minimal)  4     16 GiB   L4     ~$0.90/hr
+```
+
+### GKE (L4 or A100)
 
 ```
   #  Model                        VRAM    GPU          Est. Cost
@@ -66,114 +124,124 @@ The deploy script includes an interactive model selection wizard:
   4  Llama 3.1 8B (lightweight)   16GB    L4 (24GB)    $0.70/hr
 ```
 
-VRAM values are verified runtime requirements (not checkpoint sizes). The Nano 30B needs ~23GB at runtime, which exceeds the L4's usable 22GB — it requires an A100. The Llama 8B is the only model that fits on an L4.
+VRAM values are verified runtime requirements (not checkpoint sizes). The Nemotron Nano 30B needs ~23GB at runtime — it does **not** fit on an L4 despite NVIDIA listing it as 8GB.
 
-To skip the interactive prompt:
+## GKE-Specific Features
 
-```bash
-NEMOKUBE_MODEL=1 ./deploy.sh   # Nano 30B
-NEMOKUBE_MODEL=4 ./deploy.sh   # Llama 8B
-```
+### ComputeClass + NAP
 
-## Spot VM Support
+The GKE deployment uses ComputeClass to declare GPU requirements as a Kubernetes resource. Node Auto-Provisioning (NAP) evaluates capacity across zones and creates node pools automatically. No manual zone selection needed.
 
-The deploy script offers a Spot VM option for the GPU node pool, which reduces costs by 60-70%. Spot VMs can be preempted, but model weights are cached on a PVC that survives preemption. NIM reloads from cache in ~2-3 minutes instead of 8+ minutes cold.
-
-The ComputeClass handles Spot gracefully: when enabled, it tries Spot first and automatically falls back to on-demand if Spot capacity is unavailable.
+### Spot VM Support
 
 ```bash
-NEMOKUBE_SPOT=yes ./deploy.sh   # Spot (with on-demand fallback)
-NEMOKUBE_SPOT=no  ./deploy.sh   # On-demand only
+NEMOKUBE_SPOT=yes ./deploy.sh   # Spot first, on-demand fallback
 ```
 
-## Machine Type Override
+60-70% cheaper. Model weights are cached on a PVC that survives preemption.
 
-Override the default machine type if you have pre-existing quota:
+### Region Override
 
 ```bash
-GPU_MACHINE_TYPE=a2-highgpu-1g ./deploy.sh
+GKE_REGION=us-west1 ./deploy.sh        # GKE
+REGION=asia-southeast1 ./deploy-cloudrun.sh  # Cloud Run
 ```
 
-## Region Selection
-
-The default region is `us-central1`. To use a different region:
+### Non-Interactive Deployment
 
 ```bash
-GKE_REGION=us-west1 ./deploy.sh
+export GCP_PROJECT="my-project"
+export NVIDIA_API_KEY="nvapi-..."
+export NEMOKUBE_MODEL=4
+export NEMOKUBE_SPOT=no
+./deploy.sh  # GKE — no prompts
 ```
-
-Common regions with GPU availability: `us-central1`, `us-east1`, `us-west1`, `europe-west4` (A100), `us-west4`, `europe-west1` (L4).
-
-## Fully Non-Interactive Deployment
-
-All prompts can be skipped with environment variables:
 
 ```bash
 export GCP_PROJECT="my-project"
 export NVIDIA_API_KEY="nvapi-..."
 export NEMOKUBE_MODEL=1
-export NEMOKUBE_SPOT=yes
-export GKE_REGION=us-west1
-./deploy.sh
+./deploy-cloudrun.sh  # Cloud Run — no prompts
 ```
 
 ## After Deployment
 
-Access the dashboard:
+### Cloud Run
+
+Open the gateway URL printed at the end of deployment. Get the auth token from the logs:
+
+```bash
+gcloud run services logs read nemokube-gateway \
+  --project=$GCP_PROJECT --region=$REGION --limit=100 | grep token
+```
+
+### GKE
 
 ```bash
 kubectl -n nemokube port-forward svc/nemokube-dashboard 18789:80
 # Open http://localhost:18789
 ```
 
-Shell into the sandbox:
-
-```bash
-kubectl -n nemokube exec -it nemokube-0 -- /bin/bash
-openclaw agent --agent main --local -m "Hello from GKE!" --session-id test
-```
-
-## Inference Profiles
-
-Defaults to **nim-local** (in-cluster GPU inference via NIM). To use NVIDIA cloud inference instead (no GPU needed):
-
-```bash
-kubectl -n nemokube edit configmap nemokube-config
-# Set INFERENCE_PROFILE: "default"
-```
-
 ## File Layout
 
 ```
 nemokube/
-├── deploy.sh                         # One-command deployment (v2)
+├── deploy-cloudrun.sh            # Cloud Run deployment (serverless)
+├── deploy.sh                     # GKE deployment (Kubernetes)
+├── destroy-cloudrun.sh           # Tear down Cloud Run resources
+├── destroy-gke.sh                # Tear down GKE resources
 ├── scripts/
-│   ├── 01-create-gke-cluster.sh      # Standalone cluster creation
-│   └── 02-build-and-push-image.sh    # Standalone image build
-├── manifests/
+│   ├── 01-create-gke-cluster.sh  # Standalone cluster creation
+│   └── 02-build-and-push-image.sh
+├── manifests/                    # GKE Kubernetes manifests
 │   ├── 00-namespace.yaml
 │   ├── 01-secrets.yaml
 │   ├── 02-configmap.yaml
 │   ├── 03-nim-deployment.yaml
 │   ├── 04-nemoclaw-deployment.yaml
 │   └── 05-networkpolicy.yaml
+├── docs/
+│   ├── NemoClaw_on_CloudRun_Guide.docx
+│   ├── NemoClaw_on_GKE_Guide.docx
+│   ├── GKE_GPU_Friction_Log_v2.docx
+│   └── GKE_GPU_Friction_Log.docx
 └── README.md
 ```
 
 ## Troubleshooting
 
-**"No zones in REGION have GPU_TYPE"** — Try a different region: `GKE_REGION=us-west1 ./deploy.sh`
+**Cloud Run: "Service unavailable" on first request** — Both services scaled to zero. Wait 30-120 seconds for the cold start (GPU init + model loading).
 
-**ImagePullBackOff on NIM** — Make sure you've accepted the model license at [build.nvidia.com](https://build.nvidia.com). Search for the model name and click "Get Access."
+**Cloud Run: "too many failed auth attempts"** — Redeploy the gateway to reset the rate limiter.
 
-**CUDA out of memory** — The model doesn't fit on your GPU. The Nano 30B needs A100 (40GB), not L4 (24GB). Check the model table above.
+**GKE: "No zones in REGION have GPU_TYPE"** — Try a different region: `GKE_REGION=us-west1 ./deploy.sh`
 
-**GPU quota exceeded** — Request quota increase at IAM & Admin > Quotas. Search for "GPUs (all regions)" under Compute Engine API. You need at least 1.
+**GKE: ImagePullBackOff on NIM** — Accept the model license at [build.nvidia.com](https://build.nvidia.com).
+
+**CUDA out of memory** — The model doesn't fit. Nemotron Nano 30B needs A100 (40GB), not L4 (24GB).
+
+**GPU quota exceeded (GKE only)** — Request increase at IAM & Admin > Quotas > "GPUs (all regions)". Cloud Run auto-grants L4 quota.
+
+**Context overflow** — NIM's default 16K context is too small for NemoClaw. Both deploy scripts set `NIM_MAX_MODEL_LEN=32768`.
+
+**Model 404** — NemoClaw strips the provider prefix from model names. Both deploy scripts set `NIM_SERVED_MODEL_NAME` to work around this.
+
+## Known NemoClaw Workarounds
+
+These are specific to NemoClaw alpha (March 2026) and are handled automatically by both deploy scripts:
+
+| Issue | Cause | Fix Applied |
+|---|---|---|
+| Gateway exits in containers | `nemoclaw-start` backgrounds the gateway | Custom entrypoint with `exec openclaw gateway run` |
+| Config overwritten on restart | Hardcodes nemotron-3-super-120b | Config patched after setup, before gateway start |
+| Model 404 from NIM | OpenClaw strips provider prefix | `NIM_SERVED_MODEL_NAME` set to short name |
+| Context overflow | NIM defaults to 16K context | `NIM_MAX_MODEL_LEN=32768` |
+| Origin rejected | localhost vs 127.0.0.1 mismatch | Both origins in allowedOrigins config |
 
 ## Notes
 
 - NemoClaw is alpha software (GTC 2026). APIs are evolving.
-- VRAM sizes are runtime measurements, not checkpoint sizes on disk.
-- For production, replace K8s Secrets with GKE Workload Identity + Secret Manager.
+- VRAM sizes are runtime measurements, not checkpoint sizes.
+- This is a personal project — not supported by Google or NVIDIA.
 - Costs are estimates for `us-central1`. Pricing varies by region.
-- The `NGC_API_KEY` env var is required by NIM containers (set automatically from your NVIDIA_API_KEY).
+- For production GKE, replace K8s Secrets with Workload Identity + Secret Manager.
