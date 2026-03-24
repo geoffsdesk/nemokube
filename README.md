@@ -131,9 +131,9 @@ VRAM values are verified runtime requirements (not checkpoint sizes). The Nemotr
 
 ## GKE-Specific Features
 
-### gVisor (GKE Sandbox)
+### Security: NetworkPolicy
 
-The NemoClaw sandbox pod runs with `runtimeClassName: gvisor`, using GKE Sandbox for kernel-level isolation. This provides an additional security layer by intercepting system calls through gVisor's user-space kernel, preventing container escapes even if the application is compromised. The NIM inference pod runs without gVisor because NIM's CUDA/PyTorch stack requires direct GPU driver access that gVisor's virtualized driver (reported as version 12020) doesn't satisfy. The NIM pod is protected by NetworkPolicy instead, restricting ingress to only the NemoClaw sandbox.
+Both pods are protected by Kubernetes NetworkPolicy. The NIM inference pod only accepts traffic from the NemoClaw sandbox, and the sandbox pod's egress is restricted to NIM, DNS, and HTTPS (for NVIDIA cloud APIs). gVisor (GKE Sandbox) is not currently compatible with either pod: NIM's CUDA/PyTorch stack requires direct GPU driver access (gVisor reports driver version 12020, which is too old), and NemoClaw's gateway binds to 127.0.0.1 only, causing kubelet health probes to fail under gVisor's network namespace isolation. The manifests include commented-out `runtimeClassName: gvisor` for future re-enablement.
 
 ### ComputeClass + NAP
 

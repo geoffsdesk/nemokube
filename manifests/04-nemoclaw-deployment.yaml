@@ -25,9 +25,10 @@ spec:
         app.kubernetes.io/part-of: nemokube
         app.kubernetes.io/component: sandbox
     spec:
-      # gVisor (GKE Sandbox) — kernel-level isolation for the agent sandbox
-      # Requires GKE 1.29.2+ and --sandbox type=gvisor on the node pool
-      runtimeClassName: gvisor
+      # NOTE: gVisor disabled — NemoClaw gateway binds to 127.0.0.1 only,
+      # causing kubelet tcpSocket probes to fail under gVisor's network isolation.
+      # Protected by NetworkPolicy instead. Re-enable when NemoClaw supports 0.0.0.0.
+      # runtimeClassName: gvisor
       # Runs on CPU system pool (inference is offloaded to NIM pods)
       initContainers:
         # Build the NemoKube sandbox image from the repo's Dockerfile,

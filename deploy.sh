@@ -554,7 +554,6 @@ spec:
       labels:
         app.kubernetes.io/name: nemokube
     spec:
-      runtimeClassName: gvisor
       initContainers:
         - name: setup
           image: ${FULL_IMAGE}
