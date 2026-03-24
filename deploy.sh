@@ -439,7 +439,6 @@ spec:
       labels:
         app.kubernetes.io/name: nim-inference
     spec:
-      runtimeClassName: gvisor
       nodeSelector:
         cloud.google.com/compute-class: nemokube-gpu
       imagePullSecrets:
@@ -614,19 +613,40 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              # Run NemoClaw setup (configures plugins, auth, etc.)
-              # Pass no args so it backgrounds the gateway, then we fix config and restart
+              # Run NemoClaw setup for side effects (plugins, auth tokens, config)
               /usr/local/bin/nemoclaw-start &
               SETUP_PID=\$!
               wait \$SETUP_PID 2>/dev/null || true
+
+              # Wait for config file
+              for i in \$(seq 1 30); do
+                [ -f ~/.openclaw/openclaw.json ] && break
+                sleep 1
+              done
+
+              # Kill EVERYTHING nemoclaw-start spawned (gateway, watcher, etc.)
+              # openclaw gateway stop is unreliable — use /proc kill instead
+              MY_PID=\$\$
+              for piddir in /proc/[0-9]*; do
+                pid=\$(basename "\$piddir")
+                [ "\$pid" = "1" ] && continue
+                [ "\$pid" = "\$MY_PID" ] && continue
+                kill -9 "\$pid" 2>/dev/null || true
+              done
               sleep 2
-              # nemoclaw-start hardcodes nvidia/nemotron-3-super-120b — fix to actual NIM model
+
+              # Clean stale locks
+              find ~/.openclaw -name "*.lock" -delete 2>/dev/null || true
+              rm -f ~/.openclaw/.gateway.pid 2>/dev/null || true
+
+              # Patch config: fix model to actual NIM endpoint
               python3 -c "
               import json, os
               path = os.path.expanduser('~/.openclaw/openclaw.json')
               cfg = json.load(open(path))
               model = os.environ.get('INFERENCE_MODEL', 'meta/llama-3.1-8b-instruct')
-              cfg['agents']['defaults']['model']['primary'] = model
+              cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = model
+              if 'model' in cfg: cfg['model']['primary'] = model
               nim_endpoint = os.environ.get('NIM_ENDPOINT', 'http://nim-service.nemokube.svc.cluster.local:8000/v1')
               nim = cfg.setdefault('models', {}).setdefault('providers', {}).setdefault('nim-local', {})
               nim['baseUrl'] = nim_endpoint
@@ -636,12 +656,16 @@ spec:
               nim['models'] = [{'id': short, 'name': model, 'reasoning': False,
                 'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
                 'contextWindow': 131072, 'maxTokens': 8192}]
+              # Security settings for dashboard access
+              gw = cfg.setdefault('gateway', {})
+              ctrl = gw.setdefault('controlUi', {})
+              ctrl['allowInsecureAuth'] = True
+              ctrl['dangerouslyDisableDeviceAuth'] = True
+              ctrl['allowedOrigins'] = ['http://127.0.0.1:18789', 'http://localhost:18789']
               json.dump(cfg, open(path, 'w'), indent=2)
-              print(f'[nemokube] Model fixed to {model} via {nim_endpoint}')
+              print(f'[nemokube] Config patched: model={model}, endpoint={nim_endpoint}')
               "
-              # Stop the backgrounded gateway and relaunch in foreground
-              openclaw gateway stop 2>/dev/null || true
-              sleep 1
+              # Start gateway fresh in foreground
               exec openclaw gateway run
           ports:
             - name: dashboard

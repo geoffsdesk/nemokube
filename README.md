@@ -133,7 +133,7 @@ VRAM values are verified runtime requirements (not checkpoint sizes). The Nemotr
 
 ### gVisor (GKE Sandbox)
 
-Both the NIM inference pod and the NemoClaw sandbox pod run with `runtimeClassName: gvisor`, using GKE Sandbox for kernel-level isolation. This provides an additional security layer by intercepting system calls through gVisor's user-space kernel, preventing container escapes even if the application is compromised. GPU workloads have been supported on GKE Sandbox since GKE 1.29.2.
+The NemoClaw sandbox pod runs with `runtimeClassName: gvisor`, using GKE Sandbox for kernel-level isolation. This provides an additional security layer by intercepting system calls through gVisor's user-space kernel, preventing container escapes even if the application is compromised. The NIM inference pod runs without gVisor because NIM's CUDA/PyTorch stack requires direct GPU driver access that gVisor's virtualized driver (reported as version 12020) doesn't satisfy. The NIM pod is protected by NetworkPolicy instead, restricting ingress to only the NemoClaw sandbox.
 
 ### ComputeClass + NAP
 

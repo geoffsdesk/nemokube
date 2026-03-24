@@ -27,9 +27,9 @@ spec:
         app.kubernetes.io/part-of: nemokube
         app.kubernetes.io/component: inference
     spec:
-      # gVisor (GKE Sandbox) — kernel-level isolation for GPU workloads
-      # Requires GKE 1.29.2+ and --sandbox type=gvisor on the node pool
-      runtimeClassName: gvisor
+      # NOTE: gVisor (GKE Sandbox) is NOT compatible with NIM's CUDA/PyTorch stack.
+      # gVisor exposes a virtualized GPU driver that NIM reports as "too old" (12020).
+      # NIM runs without gVisor; the NemoClaw sandbox pod uses gVisor instead.
       # Schedule on L4 GPU nodes only
       nodeSelector:
         gpu-type: nvidia-l4
