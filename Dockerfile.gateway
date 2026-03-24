@@ -1,0 +1,13 @@
+# NemoKube Gateway — Cloud Run wrapper
+# Extends the NemoClaw sandbox image with our startup script that patches
+# the config for Cloud Run (model, NIM endpoint, allowed origins).
+ARG SANDBOX_IMAGE
+FROM ${SANDBOX_IMAGE}
+
+USER root
+COPY gateway-start.sh /usr/local/bin/gateway-start.sh
+RUN chmod +x /usr/local/bin/gateway-start.sh
+USER 1000
+
+EXPOSE 18789
+CMD ["/usr/local/bin/gateway-start.sh"]

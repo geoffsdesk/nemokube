@@ -252,13 +252,14 @@ else
     --workload-pool="${GCP_PROJECT}.svc.id.goog" \
     --logging=SYSTEM,WORKLOAD \
     --monitoring=SYSTEM \
+    --sandbox type=gvisor \
     --enable-autoprovisioning \
     --min-cpu=0 --max-cpu=96 \
     --min-memory=0 --max-memory=384 \
     --min-accelerator="type=${GPU_ACCEL},count=0" \
     --max-accelerator="type=${GPU_ACCEL},count=4" \
     --autoprovisioning-scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring
-  ok "Regional cluster created with NAP enabled"
+  ok "Regional cluster created with NAP + GKE Sandbox (gVisor) enabled"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -439,6 +440,7 @@ spec:
       labels:
         app.kubernetes.io/name: nim-inference
     spec:
+      runtimeClassName: gvisor
       nodeSelector:
         cloud.google.com/compute-class: nemokube-gpu
       imagePullSecrets:
@@ -554,6 +556,7 @@ spec:
       labels:
         app.kubernetes.io/name: nemokube
     spec:
+      runtimeClassName: gvisor
       initContainers:
         - name: setup
           image: ${FULL_IMAGE}

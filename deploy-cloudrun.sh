@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NemoKube — Cloud Run Edition
+# NemoKube — Cloud Run Edition  [WORK IN PROGRESS]
+#
+# STATUS: The NIM inference service deploys correctly on Cloud Run with L4 GPU.
+#         The gateway service has unresolved issues — NemoClaw's internal config
+#         reload triggers gateway restarts that break WebSocket connections and
+#         cause auth token mismatches. The two-phase config patch approach
+#         (gateway-start.sh) partially works but needs further iteration.
+#
 # Deploy NemoClaw + NIM inference as serverless Cloud Run services with L4 GPU.
 # Scale-to-zero when idle. No cluster management.
 # https://github.com/NVIDIA/NemoClaw → Cloud Run
@@ -199,6 +206,7 @@ gcloud run deploy nim-inference \
   --max-instances=1 \
   --timeout=600 \
   --execution-environment=gen2 \
+  --no-gpu-zonal-redundancy \
   --quiet
 
 NIM_URL=$(gcloud run services describe nim-inference \

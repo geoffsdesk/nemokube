@@ -32,7 +32,8 @@ gcloud container clusters create "${CLUSTER_NAME}" \
   --enable-ip-alias \
   --logging=SYSTEM,WORKLOAD \
   --monitoring=SYSTEM \
-  --addons=GcsFuseCsiDriver
+  --addons=GcsFuseCsiDriver \
+  --sandbox type=gvisor
 
 echo "==> Adding L4 GPU node pool: ${GPU_POOL_NAME}"
 
@@ -49,7 +50,8 @@ gcloud container node-pools create "${GPU_POOL_NAME}" \
   --min-nodes="${GPU_NODES_MIN}" \
   --max-nodes="${GPU_NODES_MAX}" \
   --node-taints="nvidia.com/gpu=present:NoSchedule" \
-  --node-labels="gpu-type=nvidia-l4"
+  --node-labels="gpu-type=nvidia-l4" \
+  --sandbox type=gvisor
 
 echo "==> Fetching cluster credentials"
 gcloud container clusters get-credentials "${CLUSTER_NAME}" \

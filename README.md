@@ -14,9 +14,12 @@ One-command deployment of [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw) 
 | **Setup** | 2 gcloud commands | Cluster + NAP + ComputeClass |
 | **GPU quota** | Auto-granted (no request) | Must request manually |
 | **GPU options** | L4 only | L4, A100, H100 |
+| **Security** | HTTPS + token auth | gVisor (GKE Sandbox) + NetworkPolicy |
 | **Script** | `deploy-cloudrun.sh` | `deploy.sh` |
 
-## Quick Start: Cloud Run (Recommended for Testing)
+## Quick Start: Cloud Run
+
+> **Work in Progress:** The Cloud Run deployment is under active development. The NIM inference service deploys and runs correctly, but the gateway service has unresolved issues with NemoClaw's config reload behavior causing WebSocket disconnects. Use the GKE deployment for a fully working setup.
 
 ```bash
 export GCP_PROJECT="your-gcp-project-id"
@@ -24,7 +27,7 @@ export NVIDIA_API_KEY="nvapi-your-key-here"
 chmod +x deploy-cloudrun.sh && ./deploy-cloudrun.sh
 ```
 
-That's it. Two Cloud Run services deploy: NIM inference with an L4 GPU, and the NemoClaw gateway on CPU. Both scale to zero when idle. You get a public HTTPS URL — no kubectl port-forward needed.
+Two Cloud Run services deploy: NIM inference with an L4 GPU, and the NemoClaw gateway on CPU. Both scale to zero when idle.
 
 **Estimated cost:** ~$0/hr idle, ~$1.65/hr active.
 
@@ -37,7 +40,7 @@ gcloud run services delete nim-inference --region=$REGION --project=$GCP_PROJECT
 gcloud run services delete nemokube-gateway --region=$REGION --project=$GCP_PROJECT -q
 ```
 
-## Quick Start: GKE (Full Kubernetes)
+## Quick Start: GKE (Recommended)
 
 ```bash
 export GCP_PROJECT="your-gcp-project-id"
@@ -128,6 +131,10 @@ VRAM values are verified runtime requirements (not checkpoint sizes). The Nemotr
 
 ## GKE-Specific Features
 
+### gVisor (GKE Sandbox)
+
+Both the NIM inference pod and the NemoClaw sandbox pod run with `runtimeClassName: gvisor`, using GKE Sandbox for kernel-level isolation. This provides an additional security layer by intercepting system calls through gVisor's user-space kernel, preventing container escapes even if the application is compromised. GPU workloads have been supported on GKE Sandbox since GKE 1.29.2.
+
 ### ComputeClass + NAP
 
 The GKE deployment uses ComputeClass to declare GPU requirements as a Kubernetes resource. Node Auto-Provisioning (NAP) evaluates capacity across zones and creates node pools automatically. No manual zone selection needed.
@@ -186,19 +193,21 @@ kubectl -n nemokube port-forward svc/nemokube-dashboard 18789:80
 
 ```
 nemokube/
-├── deploy-cloudrun.sh            # Cloud Run deployment (serverless)
-├── deploy.sh                     # GKE deployment (Kubernetes)
-├── destroy-cloudrun.sh           # Tear down Cloud Run resources
+├── deploy.sh                     # GKE deployment (Kubernetes) — recommended
+├── deploy-cloudrun.sh            # Cloud Run deployment [WIP]
 ├── destroy-gke.sh                # Tear down GKE resources
+├── destroy-cloudrun.sh           # Tear down Cloud Run resources
+├── Dockerfile.gateway            # Cloud Run gateway image [WIP]
+├── gateway-start.sh              # Cloud Run gateway entrypoint [WIP]
 ├── scripts/
-│   ├── 01-create-gke-cluster.sh  # Standalone cluster creation
+│   ├── 01-create-gke-cluster.sh  # Standalone cluster creation (gVisor enabled)
 │   └── 02-build-and-push-image.sh
 ├── manifests/                    # GKE Kubernetes manifests
 │   ├── 00-namespace.yaml
 │   ├── 01-secrets.yaml
 │   ├── 02-configmap.yaml
-│   ├── 03-nim-deployment.yaml
-│   ├── 04-nemoclaw-deployment.yaml
+│   ├── 03-nim-deployment.yaml    # NIM inference (gVisor + GPU)
+│   ├── 04-nemoclaw-deployment.yaml  # NemoClaw sandbox (gVisor)
 │   └── 05-networkpolicy.yaml
 ├── docs/
 │   ├── NemoClaw_on_CloudRun_Guide.docx
@@ -237,6 +246,8 @@ These are specific to NemoClaw alpha (March 2026) and are handled automatically 
 | Model 404 from NIM | OpenClaw strips provider prefix | `NIM_SERVED_MODEL_NAME` set to short name |
 | Context overflow | NIM defaults to 16K context | `NIM_MAX_MODEL_LEN=32768` |
 | Origin rejected | localhost vs 127.0.0.1 mismatch | Both origins in allowedOrigins config |
+| Gateway binds localhost only | Cloud Run needs 0.0.0.0 | Node.js reverse proxy on :8080 [WIP] |
+| Config reload restarts gateway | Plugin load + config patch trigger SIGUSR1 | Two-phase config patch [WIP] |
 
 ## Notes
 

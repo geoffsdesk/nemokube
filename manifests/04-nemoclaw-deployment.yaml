@@ -25,6 +25,9 @@ spec:
         app.kubernetes.io/part-of: nemokube
         app.kubernetes.io/component: sandbox
     spec:
+      # gVisor (GKE Sandbox) — kernel-level isolation for the agent sandbox
+      # Requires GKE 1.29.2+ and --sandbox type=gvisor on the node pool
+      runtimeClassName: gvisor
       # Runs on CPU system pool (inference is offloaded to NIM pods)
       initContainers:
         # Build the NemoKube sandbox image from the repo's Dockerfile,

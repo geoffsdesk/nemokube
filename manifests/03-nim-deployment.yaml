@@ -27,6 +27,9 @@ spec:
         app.kubernetes.io/part-of: nemokube
         app.kubernetes.io/component: inference
     spec:
+      # gVisor (GKE Sandbox) — kernel-level isolation for GPU workloads
+      # Requires GKE 1.29.2+ and --sandbox type=gvisor on the node pool
+      runtimeClassName: gvisor
       # Schedule on L4 GPU nodes only
       nodeSelector:
         gpu-type: nvidia-l4
