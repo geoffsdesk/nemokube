@@ -144,16 +144,19 @@ spec:
           volumeMounts:
             - name: sandbox-data
               mountPath: /sandbox
+          # exec probe required: gateway binds 127.0.0.1 only, tcpSocket probes via pod IP fail
           readinessProbe:
-            tcpSocket:
-              port: dashboard
+            exec:
+              command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
             initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
-            tcpSocket:
-              port: dashboard
+            exec:
+              command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
             initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 5
 
       volumes:
         - name: sandbox-data
