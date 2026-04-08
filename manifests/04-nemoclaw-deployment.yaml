@@ -1,13 +1,31 @@
-# NemoKube Sandbox — Hardened OpenClaw Deployment
-# K8s-native translation of NemoClaw's security model:
+# NemoKube Sandbox — Running the Real NemoClaw Process Chain
 #
-# 1. Landlock filesystem isolation — wrapper applies rules from openclaw-sandbox.yaml
-#    before exec'ing the OpenClaw gateway. Requires custom seccomp profile on nodes.
-# 2. Credential isolation — sandbox has NO API keys. Inference routes through
-#    the inference-proxy pod which injects credentials (matching OpenShell's model).
-# 3. seccomp — custom profile allowing Landlock syscalls, blocking dangerous ones.
-# 4. SecurityContext — readOnlyRootFilesystem, non-root, drop ALL capabilities.
-# 5. NetworkPolicy — applied separately in 05-networkpolicy.yaml.
+# v3 architecture: nemoclaw-start runs as PID 1 and performs its own
+# security hardening, exactly as it does in NVIDIA's container runtime:
+#
+#   nemoclaw-start (PID 1, root)
+#     → ulimit restrictions
+#     → PATH locking (export PATH, readonly PATH)
+#     → Config SHA256 integrity check
+#     → chattr +i on .openclaw (immutable config)
+#     → Capability dropping via capsh --drop=...
+#     → gosu gateway openclaw gateway run (privilege separation)
+#     → auto-pair watcher (background)
+#     → wait on gateway PID
+#
+# K8s layers on top of nemoclaw-start's native hardening:
+#   1. Custom seccomp profile — allows Landlock + capsh + chattr + gosu syscalls
+#   2. Credential isolation — inference proxy holds API keys, NOT this pod
+#   3. NetworkPolicy — sandbox → proxy → NIM only (05-networkpolicy.yaml)
+#   4. PSA baseline — blocks privileged, hostNetwork, hostPID
+#
+# WHY ROOT IS NEEDED:
+#   nemoclaw-start must run as root initially because it:
+#   - Calls capsh to drop capabilities (needs CAP_SETPCAP)
+#   - Calls chattr +i to make config immutable (needs CAP_LINUX_IMMUTABLE)
+#   - Calls gosu to switch to unprivileged 'gateway' user (needs setuid)
+#   After gosu, the gateway process runs as 'gateway' (unprivileged).
+#   This is the same privilege separation model NVIDIA uses natively.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -30,40 +48,43 @@ spec:
         app.kubernetes.io/part-of: nemokube
         app.kubernetes.io/component: sandbox
     spec:
+      # Pod-level security context.
+      # NOTE: runAsNonRoot is deliberately NOT set here.
+      # nemoclaw-start needs root initially for privilege separation
+      # (capsh, chattr +i, gosu). It drops to 'gateway' user internally.
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000     # 'sandbox' user in NemoClaw image
-        runAsGroup: 1000
         fsGroup: 1000
         seccompProfile:
           type: Localhost
           localhostProfile: profiles/nemokube-sandbox.json
 
       initContainers:
-        # Phase 1: Run nemoclaw-start to bootstrap plugins and auth tokens,
-        # then write the OpenClaw config pointing at the inference proxy
-        # (NOT directly at NIM — credentials stay out of this pod).
-        - name: setup
+        # Phase 1: Write OpenClaw config pointing at the inference proxy.
+        # nemoclaw-start will find this config, SHA256 hash it, and make
+        # it immutable with chattr +i. We write it here because on K8s
+        # there is no OpenShell L7 proxy on the host — the inference proxy
+        # pod replaces that role.
+        - name: write-config
           image: nemoclaw-sandbox:latest
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -e
-              echo "[nemokube-init] Bootstrapping NemoClaw plugins..."
+              echo "[nemokube-init] Writing OpenClaw config for K8s inference proxy..."
 
-              # Run nemoclaw-start for side effects (plugins, config scaffolding)
-              timeout 60 /usr/local/bin/nemoclaw-start 2>/dev/null || true
+              # Create config directory structure
+              mkdir -p /sandbox/.openclaw
+              mkdir -p /sandbox/.openclaw-data
+              mkdir -p /sandbox/.nemoclaw
 
-              echo "[nemokube-init] Writing OpenClaw config (inference → proxy, no API keys)..."
               python3 - <<'PYSETUP'
               import json, os
 
-              home = os.environ.get('HOME', '/sandbox')
-              config_path = os.path.join(home, '.openclaw', 'openclaw.json')
-              os.makedirs(os.path.dirname(config_path), exist_ok=True)
+              config_path = '/sandbox/.openclaw/openclaw.json'
 
               # Inference proxy endpoint — NOT the NIM service directly.
               # The proxy pod holds the NVIDIA API key and injects it.
+              # This replaces OpenShell's host-side L7 proxy on K8s.
               proxy_endpoint = os.environ.get(
                   'INFERENCE_PROXY_ENDPOINT',
                   'http://inference-proxy.nemokube.svc.cluster.local:8080/v1'
@@ -81,8 +102,9 @@ spec:
                       'providers': {
                           'nim-local': {
                               'baseUrl': proxy_endpoint,
-                              # No API key here — the proxy injects it.
-                              # This is the credential isolation boundary.
+                              # No API key here — the inference proxy injects it.
+                              # This is the K8s credential isolation boundary,
+                              # replacing OpenShell's host-side L7 proxy.
                               'apiKey': 'proxy-injected',
                               'api': 'openai-completions',
                               'models': [{
@@ -118,12 +140,10 @@ spec:
                   json.dump(cfg, f, indent=2)
               os.chmod(config_path, 0o600)
               print(f"[nemokube-init] Config written: model={model}, proxy={proxy_endpoint}")
-              print("[nemokube-init] NOTE: No NVIDIA_API_KEY in sandbox — credential isolation active")
+              print("[nemokube-init] No NVIDIA_API_KEY in sandbox — credential isolation via proxy")
               PYSETUP
 
-              # Ensure writable dirs exist for Landlock rules
-              mkdir -p ~/.openclaw-data ~/.nemoclaw
-              echo "[nemokube-init] Init complete."
+              echo "[nemokube-init] Config ready. nemoclaw-start will SHA256-verify and chattr +i it."
           env:
             - name: INFERENCE_PROXY_ENDPOINT
               value: "http://inference-proxy.nemokube.svc.cluster.local:8080/v1"
@@ -138,18 +158,31 @@ spec:
             - name: tmp
               mountPath: /tmp
           securityContext:
+            # Init runs as root to create dirs with correct ownership
+            runAsUser: 0
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-            readOnlyRootFilesystem: false  # init needs to write to bootstrap
+            readOnlyRootFilesystem: false
 
       containers:
         - name: nemokube-sandbox
           image: nemoclaw-sandbox:latest
-          # Landlock wrapper applies filesystem restrictions from
-          # openclaw-sandbox.yaml, then execs openclaw gateway run.
-          command: ["python3", "/usr/local/bin/landlock-wrapper.py"]
-          args: ["openclaw", "gateway", "run"]
+          # USE THE REAL NEMOCLAW ENTRYPOINT.
+          # nemoclaw-start is the actual NemoClaw security bootstrap:
+          #   1. Sets ulimits (nofile, nproc, core)
+          #   2. Locks PATH (readonly)
+          #   3. SHA256-verifies openclaw.json config integrity
+          #   4. Makes .openclaw immutable (chattr +i)
+          #   5. Drops capabilities via capsh
+          #   6. Switches to 'gateway' user via gosu (privilege separation)
+          #   7. Starts 'openclaw gateway run' as unprivileged gateway user
+          #   8. Starts auto-pair watcher in background
+          #   9. Waits on gateway PID
+          #
+          # This is the full NemoClaw process chain:
+          #   nemoclaw-start → gosu gateway → openclaw gateway run
+          command: ["/usr/local/bin/nemoclaw-start"]
           ports:
             - name: dashboard
               containerPort: 18789
@@ -157,6 +190,7 @@ spec:
           env:
             # NO NVIDIA_API_KEY — this is the credential isolation boundary.
             # The sandbox talks to the inference proxy, which injects credentials.
+            # This replaces OpenShell's host-side L7 proxy.
             - name: CHAT_UI_URL
               valueFrom:
                 configMapKeyRef:
@@ -167,6 +201,8 @@ spec:
                 configMapKeyRef:
                   name: nemokube-config
                   key: PUBLIC_PORT
+            - name: HOME
+              value: "/sandbox"
           resources:
             requests:
               cpu: "1"
@@ -175,30 +211,46 @@ spec:
               cpu: "2"
               memory: "4Gi"
           securityContext:
-            readOnlyRootFilesystem: false  # Landlock handles fine-grained FS control
-            allowPrivilegeEscalation: false
+            # nemoclaw-start MUST start as root for privilege separation:
+            #   - capsh needs CAP_SETPCAP to drop capabilities
+            #   - chattr +i needs CAP_LINUX_IMMUTABLE for config immutability
+            #   - gosu needs setuid to switch to 'gateway' user
+            # After gosu, the gateway process runs unprivileged.
+            runAsUser: 0
+            readOnlyRootFilesystem: false
+            # REQUIRED: gosu uses setuid to switch from root to gateway user.
+            # Without this, the privilege separation step fails.
+            allowPrivilegeEscalation: true
             capabilities:
-              drop: ["ALL"]
+              add:
+                # Needed by nemoclaw-start for its hardening sequence:
+                - SETUID        # gosu: switch to gateway user
+                - SETGID        # gosu: switch group
+                - SETPCAP       # capsh: drop capabilities
+                - CHOWN         # fix file ownership before dropping privs
+                - FOWNER        # chattr +i: set immutable flag on config
+                - DAC_OVERRIDE  # access files during bootstrap as root
+                - LINUX_IMMUTABLE  # chattr +i: make .openclaw immutable
+              drop:
+                # Drop everything else. nemoclaw-start's capsh will further
+                # drop capabilities after the hardening sequence completes.
+                - ALL
           volumeMounts:
             - name: sandbox-home
               mountPath: /sandbox
             - name: tmp
               mountPath: /tmp
-            - name: landlock-wrapper
-              mountPath: /usr/local/bin/landlock-wrapper.py
-              subPath: landlock-wrapper.py
-              readOnly: true
           # exec probe: gateway binds 127.0.0.1 only, tcpSocket via pod IP fails
           readinessProbe:
             exec:
               command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
-            initialDelaySeconds: 15
+            initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
           livenessProbe:
             exec:
               command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
-            initialDelaySeconds: 30
+            initialDelaySeconds: 40
             periodSeconds: 30
             timeoutSeconds: 5
 
@@ -209,24 +261,6 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 1Gi
-        - name: landlock-wrapper
-          configMap:
-            name: landlock-wrapper
-            defaultMode: 0555
----
-# Landlock wrapper script as a ConfigMap
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: landlock-wrapper
-  namespace: nemokube
-  labels:
-    app.kubernetes.io/part-of: nemokube
-data:
-  landlock-wrapper.py: |
-    # This file is deployed from scripts/landlock-wrapper.py
-    # See the source file for full documentation.
-    # Content is injected by deploy.sh at deployment time.
 ---
 # Headless service for StatefulSet DNS
 apiVersion: v1

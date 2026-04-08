@@ -1,11 +1,23 @@
-# NemoKube namespace with Pod Security Admission relaxed to "baseline".
-# "baseline" is required because the sandbox pod uses:
-#   - A custom seccomp profile (Localhost type, not RuntimeDefault)
-#   - hostPath volume in the seccomp installer DaemonSet
+# NemoKube namespace with Pod Security Admission at "baseline".
 #
-# "restricted" would block these. "baseline" allows custom seccomp
-# and basic host mounts while still preventing privileged containers,
-# host networking, and dangerous capabilities.
+# "baseline" is required because the sandbox pod:
+#   - Runs nemoclaw-start as root initially (needs root for capsh, chattr, gosu)
+#   - Uses allowPrivilegeEscalation: true (gosu uses setuid)
+#   - Uses a custom seccomp profile (Localhost type, not RuntimeDefault)
+#   - Adds specific capabilities (SETUID, SETGID, SETPCAP, CHOWN, FOWNER,
+#     DAC_OVERRIDE, LINUX_IMMUTABLE)
+#
+# "baseline" allows all of the above while still blocking truly dangerous
+# configurations (privileged containers, hostNetwork, hostPID).
+#
+# "restricted" would block root, allowPrivilegeEscalation, capabilities,
+# and non-RuntimeDefault seccomp — so it would break nemoclaw-start's
+# privilege separation model. We warn on restricted violations.
+#
+# After nemoclaw-start completes its hardening sequence, the actual
+# gateway process runs as unprivileged 'gateway' user with most
+# capabilities dropped (via capsh). The root requirement is only
+# during the bootstrap phase.
 apiVersion: v1
 kind: Namespace
 metadata:

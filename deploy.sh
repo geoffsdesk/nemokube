@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-# NemoKube v2 — Capacity-Aware Deployment of NemoClaw on GKE
-# Uses regional clusters + ComputeClass + NAP for automatic GPU zone selection.
+# NemoKube v3 — Real NemoClaw Process Chain on GKE
+# Runs nemoclaw-start as PID 1 for native security hardening + privilege
+# separation, with K8s layers (seccomp, NetworkPolicy, inference proxy)
+# for defense-in-depth. Uses regional clusters + ComputeClass + NAP.
 # https://github.com/NVIDIA/NemoClaw → Kubernetes
 # ============================================================================
 set -euo pipefail
@@ -435,15 +437,16 @@ EOCM
 ok "ConfigMap applied"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 11: Deploy Landlock Wrapper ConfigMap
+# Step 11: Deploy Landlock Wrapper ConfigMap (optional supplementary layer)
 # ══════════════════════════════════════════════════════════════════════════════
-step 11 "Deploying Landlock wrapper"
-echo "The Landlock wrapper applies filesystem restrictions from"
-echo "openclaw-sandbox.yaml before exec'ing the OpenClaw gateway."
+step 11 "Deploying Landlock wrapper (optional — nemoclaw-start is primary)"
+echo "The Landlock wrapper is available as a supplementary filesystem"
+echo "isolation layer. The primary hardening comes from nemoclaw-start"
+echo "running as the container entrypoint (capsh, chattr +i, gosu)."
 kubectl -n nemokube create configmap landlock-wrapper \
   --from-file=landlock-wrapper.py=scripts/landlock-wrapper.py \
   --dry-run=client -o yaml | kubectl apply -f -
-ok "Landlock wrapper ConfigMap deployed"
+ok "Landlock wrapper ConfigMap deployed (available if needed)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 12: Deploy NIM Inference
@@ -584,194 +587,34 @@ kubectl apply -f manifests/07-inference-proxy.yaml
 ok "Inference proxy deployed — credential isolation active"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 14: Deploy NemoClaw Sandbox (hardened)
+# Step 14: Deploy NemoClaw Sandbox (nemoclaw-start as entrypoint)
 # ══════════════════════════════════════════════════════════════════════════════
-step 14 "Deploying NemoClaw sandbox (hardened)"
-echo "Security layers:"
-echo "  ✓ Landlock filesystem isolation (via wrapper script)"
-echo "  ✓ Custom seccomp profile (Landlock syscalls allowed)"
-echo "  ✓ Credential isolation (API keys in proxy, not sandbox)"
-echo "  ✓ Non-root execution (user 1000)"
-echo "  ✓ Capabilities dropped (ALL)"
-cat <<EOSB | kubectl apply -f -
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: nemokube
-  namespace: nemokube
-  labels:
-    app.kubernetes.io/name: nemokube
-spec:
-  serviceName: nemokube-headless
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: nemokube
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: nemokube
-    spec:
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
-        seccompProfile:
-          type: Localhost
-          localhostProfile: profiles/nemokube-sandbox.json
-      initContainers:
-        - name: setup
-          image: ${FULL_IMAGE}
-          command: ["/bin/bash", "-c"]
-          args:
-            - |
-              set -e
-              echo "[nemokube-init] Bootstrapping NemoClaw plugins..."
-              timeout 60 /usr/local/bin/nemoclaw-start 2>/dev/null || true
+step 14 "Deploying NemoClaw sandbox (real nemoclaw-start process chain)"
+echo "Process chain: nemoclaw-start → gosu gateway → openclaw gateway run"
+echo ""
+echo "nemoclaw-start hardening (runs as PID 1):"
+echo "  ✓ ulimit restrictions"
+echo "  ✓ PATH locking (readonly)"
+echo "  ✓ Config SHA256 integrity check"
+echo "  ✓ chattr +i on .openclaw (immutable config)"
+echo "  ✓ Capability dropping via capsh"
+echo "  ✓ Privilege separation: root → gateway user (gosu)"
+echo ""
+echo "K8s layers on top:"
+echo "  ✓ Custom seccomp profile (Landlock + capsh + chattr + gosu syscalls)"
+echo "  ✓ Credential isolation (API keys in proxy, NOT sandbox)"
+echo "  ✓ NetworkPolicy (sandbox → proxy → NIM only)"
+echo "  ✓ PSA baseline enforcement"
 
-              echo "[nemokube-init] Writing OpenClaw config (inference → proxy, no API keys)..."
-              python3 - <<'PYSETUP'
-              import json, os
-              home = os.environ.get('HOME', '/sandbox')
-              config_path = os.path.join(home, '.openclaw', 'openclaw.json')
-              os.makedirs(os.path.dirname(config_path), exist_ok=True)
-              proxy_endpoint = os.environ.get('INFERENCE_PROXY_ENDPOINT',
-                  'http://inference-proxy.nemokube.svc.cluster.local:8080/v1')
-              model = os.environ.get('INFERENCE_MODEL', 'nvidia/nemotron-3-nano')
-              cfg = {
-                  'agents': {'defaults': {'model': {'primary': model}}},
-                  'models': {'mode': 'merge', 'providers': {'nim-local': {
-                      'baseUrl': proxy_endpoint,
-                      'apiKey': 'proxy-injected',
-                      'api': 'openai-completions',
-                      'models': [{'id': model.split('/')[-1], 'name': model, 'reasoning': False,
-                                   'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
-                                   'contextWindow': 131072, 'maxTokens': 8192}]
-                  }}},
-                  'gateway': {'mode': 'local', 'controlUi': {
-                      'allowInsecureAuth': True, 'dangerouslyDisableDeviceAuth': True,
-                      'allowedOrigins': ['http://127.0.0.1:18789', 'http://localhost:18789']},
-                      'trustedProxies': ['127.0.0.1', '::1']},
-              }
-              with open(config_path, 'w') as f:
-                  json.dump(cfg, f, indent=2)
-              os.chmod(config_path, 0o600)
-              print(f"[nemokube-init] Config: model={model}, proxy={proxy_endpoint}")
-              print("[nemokube-init] NOTE: No NVIDIA_API_KEY in sandbox — credential isolation active")
-              PYSETUP
-              mkdir -p ~/.openclaw-data ~/.nemoclaw
-              echo "[nemokube-init] Init complete."
-          env:
-            - name: INFERENCE_PROXY_ENDPOINT
-              value: "http://inference-proxy.nemokube.svc.cluster.local:8080/v1"
-            - name: INFERENCE_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: INFERENCE_MODEL
-          volumeMounts:
-            - name: sandbox-home
-              mountPath: /sandbox
-            - name: tmp
-              mountPath: /tmp
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-      containers:
-        - name: nemokube-sandbox
-          image: ${FULL_IMAGE}
-          command: ["python3", "/usr/local/bin/landlock-wrapper.py"]
-          args: ["openclaw", "gateway", "run"]
-          ports:
-            - name: dashboard
-              containerPort: 18789
-          env:
-            # NO NVIDIA_API_KEY — credential isolation boundary
-            - name: CHAT_UI_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: CHAT_UI_URL
-            - name: PUBLIC_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: PUBLIC_PORT
-          resources:
-            requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            - name: sandbox-home
-              mountPath: /sandbox
-            - name: tmp
-              mountPath: /tmp
-            - name: landlock-wrapper
-              mountPath: /usr/local/bin/landlock-wrapper.py
-              subPath: landlock-wrapper.py
-              readOnly: true
-          readinessProbe:
-            exec:
-              command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-          livenessProbe:
-            exec:
-              command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
-            initialDelaySeconds: 30
-            periodSeconds: 30
-            timeoutSeconds: 5
-      volumes:
-        - name: sandbox-home
-          emptyDir:
-            sizeLimit: 10Gi
-        - name: tmp
-          emptyDir:
-            sizeLimit: 1Gi
-        - name: landlock-wrapper
-          configMap:
-            name: landlock-wrapper
-            defaultMode: 0555
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: nemokube-headless
-  namespace: nemokube
-spec:
-  clusterIP: None
-  selector:
-    app.kubernetes.io/name: nemokube
-  ports:
-    - name: dashboard
-      port: 18789
-      targetPort: dashboard
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: nemokube-dashboard
-  namespace: nemokube
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: nemokube
-  ports:
-    - name: http
-      port: 80
-      targetPort: dashboard
-EOSB
-ok "NemoClaw sandbox deployed (Landlock + seccomp + credential isolation)"
+# Apply from the manifest file (which has full comments and documentation)
+kubectl apply -f manifests/04-nemoclaw-deployment.yaml
+
+# Patch the image reference to use the built image from Artifact Registry
+kubectl -n nemokube set image statefulset/nemokube \
+  nemokube-sandbox="${FULL_IMAGE}" \
+  write-config="${FULL_IMAGE}"
+
+ok "NemoClaw sandbox deployed (nemoclaw-start → gosu → openclaw gateway)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 15: Apply Network Policies
@@ -857,11 +700,17 @@ else
   warn "Seccomp profile: ${SECCOMP_READY}/${SECCOMP_DESIRED} nodes ready"
 fi
 
-# Check sandbox Landlock status
+# Check nemoclaw-start process chain
 echo ""
-echo "Checking Landlock status in sandbox..."
-kubectl -n nemokube logs nemokube-0 -c nemokube-sandbox 2>/dev/null | grep -i landlock | head -5 || \
+echo "Checking nemoclaw-start hardening status..."
+kubectl -n nemokube logs nemokube-0 -c nemokube-sandbox 2>/dev/null | grep -iE "nemoclaw|capsh|chattr|gosu|gateway|landlock" | head -10 || \
   echo "(Sandbox still starting — check logs later)"
+
+# Verify the process tree shows the expected chain
+echo ""
+echo "Process tree (expect: nemoclaw-start → gosu → openclaw gateway):"
+kubectl -n nemokube exec nemokube-0 -c nemokube-sandbox -- ps auxf 2>/dev/null | head -10 || \
+  echo "(Cannot verify process tree yet — sandbox may still be starting)"
 
 echo ""
 echo "Nodes:"
@@ -876,20 +725,29 @@ echo "╔═══════════════════════�
 echo "║                     Deployment Complete!                        ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 echo "║                                                                  ║"
-echo "║  Security layers active:                                         ║"
-echo "║    ✓ Landlock filesystem isolation (openclaw-sandbox.yaml)       ║"
-echo "║    ✓ Custom seccomp profile (Landlock syscalls allowed)          ║"
+echo "║  Process chain: nemoclaw-start → gosu → openclaw gateway          ║"
+echo "║                                                                  ║"
+echo "║  nemoclaw-start hardening (native):                              ║"
+echo "║    ✓ ulimit restrictions + PATH locking                          ║"
+echo "║    ✓ Config SHA256 integrity + chattr +i (immutable)             ║"
+echo "║    ✓ Capability dropping via capsh                               ║"
+echo "║    ✓ Privilege separation: root → gateway (gosu)                 ║"
+echo "║                                                                  ║"
+echo "║  K8s layers (defense-in-depth):                                  ║"
+echo "║    ✓ Custom seccomp profile (Landlock + capsh + gosu syscalls)   ║"
 echo "║    ✓ Credential isolation (API keys in proxy, not sandbox)       ║"
 echo "║    ✓ NetworkPolicy (sandbox → proxy → NIM, deny-default)        ║"
-echo "║    ✓ Non-root, capabilities dropped, PSA baseline               ║"
+echo "║    ✓ PSA baseline enforcement                                    ║"
 echo "║                                                                  ║"
 echo "║  Access the dashboard:                                           ║"
 echo "║    kubectl -n nemokube port-forward svc/nemokube-dashboard 18789:80"
 echo "║    Then open: http://localhost:18789                             ║"
 echo "║                                                                  ║"
 echo "║  Verify security:                                                ║"
-echo "║    # Check Landlock is active                                    ║"
-echo "║    kubectl -n nemokube logs nemokube-0 | grep landlock           ║"
+echo "║    # Check nemoclaw-start hardening completed                    ║"
+echo "║    kubectl -n nemokube logs nemokube-0 | grep nemoclaw           ║"
+echo "║    # Verify process chain (nemoclaw-start → gosu → gateway)      ║"
+echo "║    kubectl -n nemokube exec nemokube-0 -- ps auxf                ║"
 echo "║    # Verify no API key in sandbox env                            ║"
 echo "║    kubectl -n nemokube exec nemokube-0 -- env | grep NVIDIA      ║"
 echo "║    # Check NetworkPolicy enforcement                             ║"
