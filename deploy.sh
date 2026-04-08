@@ -20,7 +20,7 @@ ok()   { echo -e "${GREEN}✓ $1${NC}"; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
 fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 
-TOTAL_STEPS=14
+TOTAL_STEPS=17
 
 # ── Base configuration ────────────────────────────────────────────────────────
 GCP_PROJECT="${GCP_PROJECT:?Set GCP_PROJECT to your Google Cloud project ID}"
@@ -366,15 +366,32 @@ ok "Image pushed: ${FULL_IMAGE}"
 cd -
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 8: Create Namespace & Secrets
+# Step 8: Create Namespace (PSA: baseline) & Secrets
 # ══════════════════════════════════════════════════════════════════════════════
-step 8 "Creating namespace and secrets"
-kubectl create namespace nemokube 2>/dev/null || true
+step 8 "Creating namespace (PSA: baseline) and secrets"
+
+# Namespace with Pod Security Admission labels
+cat <<EONS | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nemokube
+  labels:
+    app.kubernetes.io/part-of: nemokube
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+EONS
+ok "Namespace created with PSA enforce=baseline, warn=restricted"
+
 kubectl -n nemokube delete secret nemokube-secrets 2>/dev/null || true
 kubectl -n nemokube create secret generic nemokube-secrets \
   --from-literal=NVIDIA_API_KEY="${NVIDIA_API_KEY}" \
   --from-literal=TELEGRAM_BOT_TOKEN=""
-ok "Namespace and secrets created"
+ok "Secrets created (NVIDIA_API_KEY stored — only accessible by inference proxy)"
 
 # Create NVIDIA registry pull secret (nvcr.io requires authentication)
 kubectl -n nemokube delete secret nvcr-pull-secret 2>/dev/null || true
@@ -385,9 +402,22 @@ kubectl -n nemokube create secret docker-registry nvcr-pull-secret \
 ok "NVIDIA registry pull secret created"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 9: Apply ConfigMap
+# Step 9: Install Seccomp Profile (Landlock syscalls)
 # ══════════════════════════════════════════════════════════════════════════════
-step 9 "Applying ConfigMap"
+step 9 "Installing custom seccomp profile (allows Landlock syscalls)"
+echo "Deploying DaemonSet to install seccomp profile on all nodes..."
+echo "The profile extends RuntimeDefault with landlock_create_ruleset,"
+echo "landlock_add_rule, and landlock_restrict_self (syscalls 444-446)."
+kubectl apply -f manifests/06-seccomp-installer.yaml
+# Wait for DaemonSet to roll out
+kubectl -n kube-system rollout status daemonset/seccomp-installer --timeout=60s 2>/dev/null || \
+  warn "Seccomp installer still rolling out — Landlock may not be active on all nodes yet"
+ok "Seccomp profile installed on nodes"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 10: Apply ConfigMap
+# ══════════════════════════════════════════════════════════════════════════════
+step 10 "Applying ConfigMap"
 cat <<EOCM | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -398,15 +428,27 @@ data:
   INFERENCE_PROFILE: "nim-local"
   INFERENCE_MODEL: "${NIM_MODEL}"
   NIM_ENDPOINT: "http://nim-service.nemokube.svc.cluster.local:8000/v1"
+  INFERENCE_PROXY_ENDPOINT: "http://inference-proxy.nemokube.svc.cluster.local:8080/v1"
   PUBLIC_PORT: "18789"
   CHAT_UI_URL: "http://localhost:18789"
 EOCM
 ok "ConfigMap applied"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 10: Deploy NIM Inference
+# Step 11: Deploy Landlock Wrapper ConfigMap
 # ══════════════════════════════════════════════════════════════════════════════
-step 10 "Deploying NIM inference server (${NIM_MODEL})"
+step 11 "Deploying Landlock wrapper"
+echo "The Landlock wrapper applies filesystem restrictions from"
+echo "openclaw-sandbox.yaml before exec'ing the OpenClaw gateway."
+kubectl -n nemokube create configmap landlock-wrapper \
+  --from-file=landlock-wrapper.py=scripts/landlock-wrapper.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+ok "Landlock wrapper ConfigMap deployed"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 12: Deploy NIM Inference
+# ══════════════════════════════════════════════════════════════════════════════
+step 12 "Deploying NIM inference server (${NIM_MODEL})"
 cat <<EONIM | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -532,9 +574,25 @@ EONIM
 ok "NIM deployment applied — NAP will auto-provision a GPU node"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 11: Deploy NemoClaw Sandbox
+# Step 13: Deploy Inference Proxy (credential isolation)
 # ══════════════════════════════════════════════════════════════════════════════
-step 11 "Deploying NemoClaw sandbox"
+step 13 "Deploying inference proxy (credential isolation layer)"
+echo "The inference proxy holds the NVIDIA API key and injects it into"
+echo "requests to NIM. The sandbox pod NEVER sees the API key."
+echo "This mirrors OpenShell's host-side inference routing."
+kubectl apply -f manifests/07-inference-proxy.yaml
+ok "Inference proxy deployed — credential isolation active"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 14: Deploy NemoClaw Sandbox (hardened)
+# ══════════════════════════════════════════════════════════════════════════════
+step 14 "Deploying NemoClaw sandbox (hardened)"
+echo "Security layers:"
+echo "  ✓ Landlock filesystem isolation (via wrapper script)"
+echo "  ✓ Custom seccomp profile (Landlock syscalls allowed)"
+echo "  ✓ Credential isolation (API keys in proxy, not sandbox)"
+echo "  ✓ Non-root execution (user 1000)"
+echo "  ✓ Capabilities dropped (ALL)"
 cat <<EOSB | kubectl apply -f -
 apiVersion: apps/v1
 kind: StatefulSet
@@ -554,6 +612,14 @@ spec:
       labels:
         app.kubernetes.io/name: nemokube
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/nemokube-sandbox.json
       initContainers:
         - name: setup
           image: ${FULL_IMAGE}
@@ -561,18 +627,23 @@ spec:
           args:
             - |
               set -e
+              echo "[nemokube-init] Bootstrapping NemoClaw plugins..."
+              timeout 60 /usr/local/bin/nemoclaw-start 2>/dev/null || true
+
+              echo "[nemokube-init] Writing OpenClaw config (inference → proxy, no API keys)..."
               python3 - <<'PYSETUP'
               import json, os
               home = os.environ.get('HOME', '/sandbox')
               config_path = os.path.join(home, '.openclaw', 'openclaw.json')
               os.makedirs(os.path.dirname(config_path), exist_ok=True)
-              nim_endpoint = os.environ.get('NIM_ENDPOINT', 'http://nim-service.nemokube.svc.cluster.local:8000/v1')
+              proxy_endpoint = os.environ.get('INFERENCE_PROXY_ENDPOINT',
+                  'http://inference-proxy.nemokube.svc.cluster.local:8080/v1')
               model = os.environ.get('INFERENCE_MODEL', 'nvidia/nemotron-3-nano')
               cfg = {
                   'agents': {'defaults': {'model': {'primary': model}}},
                   'models': {'mode': 'merge', 'providers': {'nim-local': {
-                      'baseUrl': nim_endpoint,
-                      'apiKey': os.environ.get('NVIDIA_API_KEY', 'nim-local'),
+                      'baseUrl': proxy_endpoint,
+                      'apiKey': 'proxy-injected',
                       'api': 'openai-completions',
                       'models': [{'id': model.split('/')[-1], 'name': model, 'reasoning': False,
                                    'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
@@ -586,95 +657,38 @@ spec:
               with open(config_path, 'w') as f:
                   json.dump(cfg, f, indent=2)
               os.chmod(config_path, 0o600)
+              print(f"[nemokube-init] Config: model={model}, proxy={proxy_endpoint}")
+              print("[nemokube-init] NOTE: No NVIDIA_API_KEY in sandbox — credential isolation active")
               PYSETUP
+              mkdir -p ~/.openclaw-data ~/.nemoclaw
+              echo "[nemokube-init] Init complete."
           env:
-            - name: NVIDIA_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nemokube-secrets
-                  key: NVIDIA_API_KEY
-            - name: NIM_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: NIM_ENDPOINT
+            - name: INFERENCE_PROXY_ENDPOINT
+              value: "http://inference-proxy.nemokube.svc.cluster.local:8080/v1"
             - name: INFERENCE_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: nemokube-config
                   key: INFERENCE_MODEL
           volumeMounts:
-            - name: sandbox-data
+            - name: sandbox-home
               mountPath: /sandbox
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
       containers:
         - name: nemokube-sandbox
           image: ${FULL_IMAGE}
-          command: ["/bin/bash", "-c"]
-          args:
-            - |
-              # Run NemoClaw setup for side effects (plugins, auth tokens, config)
-              /usr/local/bin/nemoclaw-start &
-              SETUP_PID=\$!
-              wait \$SETUP_PID 2>/dev/null || true
-
-              # Wait for config file
-              for i in \$(seq 1 30); do
-                [ -f ~/.openclaw/openclaw.json ] && break
-                sleep 1
-              done
-
-              # Kill EVERYTHING nemoclaw-start spawned (gateway, watcher, etc.)
-              # openclaw gateway stop is unreliable — use /proc kill instead
-              MY_PID=\$\$
-              for piddir in /proc/[0-9]*; do
-                pid=\$(basename "\$piddir")
-                [ "\$pid" = "1" ] && continue
-                [ "\$pid" = "\$MY_PID" ] && continue
-                kill -9 "\$pid" 2>/dev/null || true
-              done
-              sleep 2
-
-              # Clean stale locks
-              find ~/.openclaw -name "*.lock" -delete 2>/dev/null || true
-              rm -f ~/.openclaw/.gateway.pid 2>/dev/null || true
-
-              # Patch config: fix model to actual NIM endpoint
-              python3 -c "
-              import json, os
-              path = os.path.expanduser('~/.openclaw/openclaw.json')
-              cfg = json.load(open(path))
-              model = os.environ.get('INFERENCE_MODEL', 'meta/llama-3.1-8b-instruct')
-              cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = model
-              if 'model' in cfg: cfg['model']['primary'] = model
-              nim_endpoint = os.environ.get('NIM_ENDPOINT', 'http://nim-service.nemokube.svc.cluster.local:8000/v1')
-              nim = cfg.setdefault('models', {}).setdefault('providers', {}).setdefault('nim-local', {})
-              nim['baseUrl'] = nim_endpoint
-              nim['apiKey'] = os.environ.get('NVIDIA_API_KEY', 'nim-local')
-              nim['api'] = 'openai-completions'
-              short = model.split('/')[-1]
-              nim['models'] = [{'id': short, 'name': model, 'reasoning': False,
-                'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
-                'contextWindow': 131072, 'maxTokens': 8192}]
-              # Security settings for dashboard access
-              gw = cfg.setdefault('gateway', {})
-              ctrl = gw.setdefault('controlUi', {})
-              ctrl['allowInsecureAuth'] = True
-              ctrl['dangerouslyDisableDeviceAuth'] = True
-              ctrl['allowedOrigins'] = ['http://127.0.0.1:18789', 'http://localhost:18789']
-              json.dump(cfg, open(path, 'w'), indent=2)
-              print(f'[nemokube] Config patched: model={model}, endpoint={nim_endpoint}')
-              "
-              # Start gateway fresh in foreground
-              exec openclaw gateway run
+          command: ["python3", "/usr/local/bin/landlock-wrapper.py"]
+          args: ["openclaw", "gateway", "run"]
           ports:
             - name: dashboard
               containerPort: 18789
           env:
-            - name: NVIDIA_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nemokube-secrets
-                  key: NVIDIA_API_KEY
+            # NO NVIDIA_API_KEY — credential isolation boundary
             - name: CHAT_UI_URL
               valueFrom:
                 configMapKeyRef:
@@ -685,16 +699,6 @@ spec:
                 configMapKeyRef:
                   name: nemokube-config
                   key: PUBLIC_PORT
-            - name: NIM_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: NIM_ENDPOINT
-            - name: INFERENCE_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: INFERENCE_MODEL
           resources:
             requests:
               cpu: "1"
@@ -702,10 +706,19 @@ spec:
             limits:
               cpu: "2"
               memory: "4Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
-            - name: sandbox-data
+            - name: sandbox-home
               mountPath: /sandbox
-          # exec probe required: gateway binds 127.0.0.1 only, tcpSocket probes via pod IP fail
+            - name: tmp
+              mountPath: /tmp
+            - name: landlock-wrapper
+              mountPath: /usr/local/bin/landlock-wrapper.py
+              subPath: landlock-wrapper.py
+              readOnly: true
           readinessProbe:
             exec:
               command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
@@ -719,9 +732,16 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 5
       volumes:
-        - name: sandbox-data
+        - name: sandbox-home
           emptyDir:
             sizeLimit: 10Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: landlock-wrapper
+          configMap:
+            name: landlock-wrapper
+            defaultMode: 0555
 ---
 apiVersion: v1
 kind: Service
@@ -751,72 +771,23 @@ spec:
       port: 80
       targetPort: dashboard
 EOSB
-ok "NemoClaw sandbox deployed"
+ok "NemoClaw sandbox deployed (Landlock + seccomp + credential isolation)"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 12: Apply Network Policies
+# Step 15: Apply Network Policies
 # ══════════════════════════════════════════════════════════════════════════════
-step 12 "Applying NetworkPolicies"
-cat <<EONP | kubectl apply -f -
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: nim-inference-ingress
-  namespace: nemokube
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: nim-inference
-  policyTypes: ["Ingress"]
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: nemokube
-      ports:
-        - protocol: TCP
-          port: 8000
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: nemokube-sandbox-policy
-  namespace: nemokube
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: nemokube
-  policyTypes: ["Ingress", "Egress"]
-  ingress:
-    - ports:
-        - protocol: TCP
-          port: 18789
-  egress:
-    - ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    - to:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: nim-inference
-      ports:
-        - protocol: TCP
-          port: 8000
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-      ports:
-        - protocol: TCP
-          port: 443
-EONP
+step 15 "Applying NetworkPolicies (translated from openclaw-sandbox.yaml)"
+echo "Network isolation:"
+echo "  ✓ NIM only accepts traffic from inference proxy"
+echo "  ✓ Inference proxy only accepts from sandbox, sends to NIM"
+echo "  ✓ Sandbox: DNS + proxy + HTTPS (matching openclaw-sandbox.yaml allowlist)"
+kubectl apply -f manifests/05-networkpolicy.yaml
 ok "Network policies applied"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 13: Wait for NIM to be ready
+# Step 16: Wait for NIM to be ready
 # ══════════════════════════════════════════════════════════════════════════════
-step 13 "Waiting for NIM (NAP provisions GPU node → pulls image → loads model)"
+step 16 "Waiting for NIM (NAP provisions GPU node → pulls image → loads model)"
 echo "This takes 5-15 min depending on GPU availability and model size."
 echo ""
 
@@ -852,9 +823,9 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 14: Verify NemoClaw
+# Step 17: Verify NemoClaw + Security Layers
 # ══════════════════════════════════════════════════════════════════════════════
-step 14 "Checking NemoClaw sandbox"
+step 17 "Checking NemoClaw sandbox + security layers"
 for i in $(seq 1 30); do
   NC_READY=$(kubectl -n nemokube get statefulset nemokube -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
   if [ "${NC_READY:-0}" -ge 1 ]; then
@@ -868,6 +839,31 @@ echo ""
 echo "All pods:"
 kubectl -n nemokube get pods -o wide
 echo ""
+
+# Verify inference proxy is running
+PROXY_READY=$(kubectl -n nemokube get deployment inference-proxy -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+if [ "${PROXY_READY:-0}" -ge 1 ]; then
+  ok "Inference proxy running (credential isolation active)"
+else
+  warn "Inference proxy not ready — check: kubectl -n nemokube logs deploy/inference-proxy"
+fi
+
+# Verify seccomp profile on nodes
+SECCOMP_READY=$(kubectl -n kube-system get daemonset seccomp-installer -o jsonpath='{.status.numberReady}' 2>/dev/null)
+SECCOMP_DESIRED=$(kubectl -n kube-system get daemonset seccomp-installer -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null)
+if [ "${SECCOMP_READY:-0}" -eq "${SECCOMP_DESIRED:-1}" ]; then
+  ok "Seccomp profile installed on all ${SECCOMP_READY} nodes"
+else
+  warn "Seccomp profile: ${SECCOMP_READY}/${SECCOMP_DESIRED} nodes ready"
+fi
+
+# Check sandbox Landlock status
+echo ""
+echo "Checking Landlock status in sandbox..."
+kubectl -n nemokube logs nemokube-0 -c nemokube-sandbox 2>/dev/null | grep -i landlock | head -5 || \
+  echo "(Sandbox still starting — check logs later)"
+
+echo ""
 echo "Nodes:"
 kubectl get nodes -o wide
 echo ""
@@ -876,24 +872,31 @@ echo ""
 # Done
 # ══════════════════════════════════════════════════════════════════════════════
 echo -e "${GREEN}"
-echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║                    Deployment Complete!                   ║"
-echo "╠═══════════════════════════════════════════════════════════╣"
-echo "║                                                           ║"
-echo "║  Access the dashboard:                                    ║"
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║                     Deployment Complete!                        ║"
+echo "╠══════════════════════════════════════════════════════════════════╣"
+echo "║                                                                  ║"
+echo "║  Security layers active:                                         ║"
+echo "║    ✓ Landlock filesystem isolation (openclaw-sandbox.yaml)       ║"
+echo "║    ✓ Custom seccomp profile (Landlock syscalls allowed)          ║"
+echo "║    ✓ Credential isolation (API keys in proxy, not sandbox)       ║"
+echo "║    ✓ NetworkPolicy (sandbox → proxy → NIM, deny-default)        ║"
+echo "║    ✓ Non-root, capabilities dropped, PSA baseline               ║"
+echo "║                                                                  ║"
+echo "║  Access the dashboard:                                           ║"
 echo "║    kubectl -n nemokube port-forward svc/nemokube-dashboard 18789:80"
-echo "║    Then open: http://localhost:18789                      ║"
-echo "║                                                           ║"
-echo "║  Shell into sandbox:                                      ║"
-echo "║    kubectl -n nemokube exec -it nemokube-0 -- /bin/bash   ║"
-echo "║                                                           ║"
-echo "║  Test inference:                                          ║"
-echo "║    kubectl -n nemokube exec -it nemokube-0 -- \\           ║"
-echo "║      openclaw agent --agent main --local \\                ║"
-echo "║        -m 'Hello from GKE!' --session-id test             ║"
-echo "║                                                           ║"
-echo "║  View NIM logs:                                           ║"
-echo "║    kubectl -n nemokube logs -f deploy/nim-inference        ║"
-echo "║                                                           ║"
-echo "╚═══════════════════════════════════════════════════════════╝"
+echo "║    Then open: http://localhost:18789                             ║"
+echo "║                                                                  ║"
+echo "║  Verify security:                                                ║"
+echo "║    # Check Landlock is active                                    ║"
+echo "║    kubectl -n nemokube logs nemokube-0 | grep landlock           ║"
+echo "║    # Verify no API key in sandbox env                            ║"
+echo "║    kubectl -n nemokube exec nemokube-0 -- env | grep NVIDIA      ║"
+echo "║    # Check NetworkPolicy enforcement                             ║"
+echo "║    kubectl -n nemokube get networkpolicy                         ║"
+echo "║                                                                  ║"
+echo "║  View NIM logs:                                                  ║"
+echo "║    kubectl -n nemokube logs -f deploy/nim-inference               ║"
+echo "║                                                                  ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"

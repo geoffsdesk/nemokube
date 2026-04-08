@@ -1,6 +1,21 @@
+# NemoKube namespace with Pod Security Admission relaxed to "baseline".
+# "baseline" is required because the sandbox pod uses:
+#   - A custom seccomp profile (Localhost type, not RuntimeDefault)
+#   - hostPath volume in the seccomp installer DaemonSet
+#
+# "restricted" would block these. "baseline" allows custom seccomp
+# and basic host mounts while still preventing privileged containers,
+# host networking, and dangerous capabilities.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: nemokube
   labels:
     app.kubernetes.io/part-of: nemokube
+    # Pod Security Admission — enforce baseline, warn on restricted
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest

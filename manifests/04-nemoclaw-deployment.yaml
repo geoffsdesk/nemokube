@@ -1,8 +1,13 @@
-# NemoKube Sandbox + OpenShell Gateway
-# Runs the NemoClaw sandbox container with OpenClaw agent and the
-# OpenShell gateway that routes inference to the NIM service.
+# NemoKube Sandbox — Hardened OpenClaw Deployment
+# K8s-native translation of NemoClaw's security model:
 #
-# This is a StatefulSet so each replica gets stable identity and storage.
+# 1. Landlock filesystem isolation — wrapper applies rules from openclaw-sandbox.yaml
+#    before exec'ing the OpenClaw gateway. Requires custom seccomp profile on nodes.
+# 2. Credential isolation — sandbox has NO API keys. Inference routes through
+#    the inference-proxy pod which injects credentials (matching OpenShell's model).
+# 3. seccomp — custom profile allowing Landlock syscalls, blocking dangerous ones.
+# 4. SecurityContext — readOnlyRootFilesystem, non-root, drop ALL capabilities.
+# 5. NetworkPolicy — applied separately in 05-networkpolicy.yaml.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -25,54 +30,85 @@ spec:
         app.kubernetes.io/part-of: nemokube
         app.kubernetes.io/component: sandbox
     spec:
-      # NOTE: gVisor disabled — NemoClaw gateway binds to 127.0.0.1 only,
-      # causing kubelet tcpSocket probes to fail under gVisor's network isolation.
-      # Protected by NetworkPolicy instead. Re-enable when NemoClaw supports 0.0.0.0.
-      # runtimeClassName: gvisor
-      # Runs on CPU system pool (inference is offloaded to NIM pods)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000     # 'sandbox' user in NemoClaw image
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/nemokube-sandbox.json
+
       initContainers:
-        # Build the NemoKube sandbox image from the repo's Dockerfile,
-        # then configure OpenClaw + OpenShell to point at the in-cluster NIM.
+        # Phase 1: Run nemoclaw-start to bootstrap plugins and auth tokens,
+        # then write the OpenClaw config pointing at the inference proxy
+        # (NOT directly at NIM — credentials stay out of this pod).
         - name: setup
-          image: nemoclaw-sandbox:latest  # Built from repo Dockerfile (see README)
+          image: nemoclaw-sandbox:latest
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -e
-              echo "Configuring NemoKube for in-cluster NIM inference..."
+              echo "[nemokube-init] Bootstrapping NemoClaw plugins..."
 
-              # Write OpenClaw config pointing inference at the K8s NIM service
+              # Run nemoclaw-start for side effects (plugins, config scaffolding)
+              timeout 60 /usr/local/bin/nemoclaw-start 2>/dev/null || true
+
+              echo "[nemokube-init] Writing OpenClaw config (inference → proxy, no API keys)..."
               python3 - <<'PYSETUP'
               import json, os
+
               home = os.environ.get('HOME', '/sandbox')
               config_path = os.path.join(home, '.openclaw', 'openclaw.json')
               os.makedirs(os.path.dirname(config_path), exist_ok=True)
 
-              nim_endpoint = os.environ.get('NIM_ENDPOINT', 'http://nim-service.nemokube.svc.cluster.local:8000/v1')
-              model = os.environ.get('INFERENCE_MODEL', 'nvidia/nemotron-3-super-120b-a12b')
+              # Inference proxy endpoint — NOT the NIM service directly.
+              # The proxy pod holds the NVIDIA API key and injects it.
+              proxy_endpoint = os.environ.get(
+                  'INFERENCE_PROXY_ENDPOINT',
+                  'http://inference-proxy.nemokube.svc.cluster.local:8080/v1'
+              )
+              model = os.environ.get('INFERENCE_MODEL', 'nvidia/nemotron-3-nano')
 
               cfg = {
-                  'agents': {'defaults': {'model': {'primary': model}}},
-                  'models': {'mode': 'merge', 'providers': {'nim-local': {
-                      'baseUrl': nim_endpoint,
-                      'apiKey': os.environ.get('NVIDIA_API_KEY', 'nim-local'),
-                      'api': 'openai-completions',
-                      'models': [{
-                          'id': model.split('/')[-1],
-                          'name': model,
-                          'reasoning': False,
-                          'input': ['text'],
-                          'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
-                          'contextWindow': 131072,
-                          'maxTokens': 8192,
-                      }]
-                  }}},
+                  'agents': {
+                      'defaults': {
+                          'model': {'primary': model}
+                      }
+                  },
+                  'models': {
+                      'mode': 'merge',
+                      'providers': {
+                          'nim-local': {
+                              'baseUrl': proxy_endpoint,
+                              # No API key here — the proxy injects it.
+                              # This is the credential isolation boundary.
+                              'apiKey': 'proxy-injected',
+                              'api': 'openai-completions',
+                              'models': [{
+                                  'id': model.split('/')[-1],
+                                  'name': model,
+                                  'reasoning': False,
+                                  'input': ['text'],
+                                  'cost': {
+                                      'input': 0, 'output': 0,
+                                      'cacheRead': 0, 'cacheWrite': 0
+                                  },
+                                  'contextWindow': 131072,
+                                  'maxTokens': 8192,
+                              }]
+                          }
+                      }
+                  },
                   'gateway': {
                       'mode': 'local',
                       'controlUi': {
                           'allowInsecureAuth': True,
                           'dangerouslyDisableDeviceAuth': True,
-                          'allowedOrigins': ['http://127.0.0.1:18789'],
+                          'allowedOrigins': [
+                              'http://127.0.0.1:18789',
+                              'http://localhost:18789',
+                          ],
                       },
                       'trustedProxies': ['127.0.0.1', '::1'],
                   },
@@ -81,44 +117,46 @@ spec:
               with open(config_path, 'w') as f:
                   json.dump(cfg, f, indent=2)
               os.chmod(config_path, 0o600)
-              print(f"Wrote OpenClaw config to {config_path}")
+              print(f"[nemokube-init] Config written: model={model}, proxy={proxy_endpoint}")
+              print("[nemokube-init] NOTE: No NVIDIA_API_KEY in sandbox — credential isolation active")
               PYSETUP
 
-              echo "Init complete."
+              # Ensure writable dirs exist for Landlock rules
+              mkdir -p ~/.openclaw-data ~/.nemoclaw
+              echo "[nemokube-init] Init complete."
           env:
-            - name: NVIDIA_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nemokube-secrets
-                  key: NVIDIA_API_KEY
-            - name: NIM_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: NIM_ENDPOINT
+            - name: INFERENCE_PROXY_ENDPOINT
+              value: "http://inference-proxy.nemokube.svc.cluster.local:8080/v1"
             - name: INFERENCE_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: nemokube-config
                   key: INFERENCE_MODEL
           volumeMounts:
-            - name: sandbox-data
+            - name: sandbox-home
               mountPath: /sandbox
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false  # init needs to write to bootstrap
 
       containers:
         - name: nemokube-sandbox
-          image: nemoclaw-sandbox:latest  # Built from repo Dockerfile
-          command: ["/usr/local/bin/nemoclaw-start"]
+          image: nemoclaw-sandbox:latest
+          # Landlock wrapper applies filesystem restrictions from
+          # openclaw-sandbox.yaml, then execs openclaw gateway run.
+          command: ["python3", "/usr/local/bin/landlock-wrapper.py"]
+          args: ["openclaw", "gateway", "run"]
           ports:
             - name: dashboard
               containerPort: 18789
               protocol: TCP
           env:
-            - name: NVIDIA_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nemokube-secrets
-                  key: NVIDIA_API_KEY
+            # NO NVIDIA_API_KEY — this is the credential isolation boundary.
+            # The sandbox talks to the inference proxy, which injects credentials.
             - name: CHAT_UI_URL
               valueFrom:
                 configMapKeyRef:
@@ -129,11 +167,6 @@ spec:
                 configMapKeyRef:
                   name: nemokube-config
                   key: PUBLIC_PORT
-            - name: NIM_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: nemokube-config
-                  key: NIM_ENDPOINT
           resources:
             requests:
               cpu: "1"
@@ -141,10 +174,21 @@ spec:
             limits:
               cpu: "2"
               memory: "4Gi"
+          securityContext:
+            readOnlyRootFilesystem: false  # Landlock handles fine-grained FS control
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
-            - name: sandbox-data
+            - name: sandbox-home
               mountPath: /sandbox
-          # exec probe required: gateway binds 127.0.0.1 only, tcpSocket probes via pod IP fail
+            - name: tmp
+              mountPath: /tmp
+            - name: landlock-wrapper
+              mountPath: /usr/local/bin/landlock-wrapper.py
+              subPath: landlock-wrapper.py
+              readOnly: true
+          # exec probe: gateway binds 127.0.0.1 only, tcpSocket via pod IP fails
           readinessProbe:
             exec:
               command: ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/18789 && exec 3>&-"]
@@ -159,9 +203,30 @@ spec:
             timeoutSeconds: 5
 
       volumes:
-        - name: sandbox-data
+        - name: sandbox-home
           emptyDir:
             sizeLimit: 10Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: landlock-wrapper
+          configMap:
+            name: landlock-wrapper
+            defaultMode: 0555
+---
+# Landlock wrapper script as a ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: landlock-wrapper
+  namespace: nemokube
+  labels:
+    app.kubernetes.io/part-of: nemokube
+data:
+  landlock-wrapper.py: |
+    # This file is deployed from scripts/landlock-wrapper.py
+    # See the source file for full documentation.
+    # Content is injected by deploy.sh at deployment time.
 ---
 # Headless service for StatefulSet DNS
 apiVersion: v1

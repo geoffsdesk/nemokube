@@ -1,8 +1,15 @@
-# Kubernetes NetworkPolicies for NemoKube
-# These mirror the sandbox security model from openclaw-sandbox.yaml
-# but enforce at the cluster networking layer.
+# Kubernetes NetworkPolicies — K8s-native translation of openclaw-sandbox.yaml
+#
+# NemoClaw's OpenShell enforces per-binary, per-endpoint network rules.
+# K8s NetworkPolicy operates at the pod/port level (coarser granularity).
+# This is the closest K8s-native approximation:
+#
+# - Sandbox → inference proxy (not NIM directly) on port 8080
+# - Inference proxy → NIM on port 8000
+# - NIM accepts traffic only from inference proxy
+# - Sandbox egress: DNS + proxy + HTTPS (for NVIDIA cloud, npm, GitHub, etc.)
 
-# NIM inference pods: only accept traffic from NemoKube sandbox pods
+# ── NIM: only accepts traffic from inference proxy ──────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -18,17 +25,74 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: nemokube
+              app.kubernetes.io/name: inference-proxy
       ports:
         - protocol: TCP
           port: 8000
 ---
-# NemoKube sandbox: allow dashboard access + egress to NIM and required APIs
+# ── Inference proxy: accepts from sandbox, sends to NIM ─────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: inference-proxy-policy
+  namespace: nemokube
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: inference-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the sandbox can talk to the proxy
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nemokube
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NIM inference (in-cluster)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nim-inference
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# ── Sandbox: strict egress matching openclaw-sandbox.yaml ───────────────────
+# The official policy allowlists specific hosts:
+#   - NVIDIA APIs (integrate.api.nvidia.com, inference-api.nvidia.com)
+#   - GitHub (github.com, api.github.com)
+#   - npm registry (registry.npmjs.org)
+#   - OpenClaw APIs (openclaw.ai, docs.openclaw.ai, clawhub.ai)
+#   - Anthropic APIs (api.anthropic.com, statsig.anthropic.com)
+#   - Telegram API (api.telegram.org)
+#   - Discord (discord.com, gateway.discord.gg, cdn.discordapp.com)
+#
+# K8s NetworkPolicy can't filter by hostname (only IP/CIDR + port).
+# We allow HTTPS (443) egress to any IP, matching the intent of the
+# original policy. For tighter control, use a NetworkPolicy engine
+# that supports FQDN rules (Cilium, Calico Enterprise).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: nemokube-sandbox-policy
   namespace: nemokube
+  annotations:
+    nemokube.io/note: |
+      This policy approximates openclaw-sandbox.yaml at the K8s level.
+      For per-host FQDN filtering, deploy Cilium with CiliumNetworkPolicy.
+      See: https://docs.cilium.io/en/stable/security/policy/language/#dns-based
 spec:
   podSelector:
     matchLabels:
@@ -37,7 +101,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow dashboard access from within the cluster
+    # Dashboard access from within the cluster (port-forward or Ingress)
     - ports:
         - protocol: TCP
           port: 18789
@@ -49,15 +113,46 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # NIM inference service (in-cluster)
+    # Inference proxy (in-cluster) — NOT NIM directly
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: nim-inference
+              app.kubernetes.io/name: inference-proxy
       ports:
         - protocol: TCP
-          port: 8000
-    # NVIDIA cloud APIs (for API key auth and fallback)
+          port: 8080
+    # HTTPS to external services (NVIDIA cloud, GitHub, npm, OpenClaw APIs,
+    # Anthropic, Telegram, Discord — matching openclaw-sandbox.yaml allowlist)
+    # NOTE: K8s NetworkPolicy can't filter by hostname. This allows 443 to
+    # any IP. For FQDN filtering, use Cilium CiliumNetworkPolicy.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# ── NIM egress: model download + health ─────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nim-inference-egress
+  namespace: nemokube
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nim-inference
+  policyTypes:
+    - Egress
+  egress:
+    # DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NVIDIA NGC / model registry (HTTPS for model downloads + auth)
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
