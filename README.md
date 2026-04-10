@@ -12,8 +12,6 @@ NemoKube is one of several ways to run NemoClaw in a Kubernetes environment. Bef
 
 **NVIDIA's official method (nested containers):** The [NemoClaw repository](https://github.com/NVIDIA/NemoClaw) runs OpenShell inside a Kubernetes pod, effectively nesting container management within K8s. This preserves the full OpenShell runtime (including its native Landlock, seccomp, and credential management) at the cost of requiring privileged pods or sysbox for nested container support. If your cluster allows privileged workloads, this is the most faithful way to run NemoClaw on K8s.
 
-**gVisor variant (under testing):** A separate branch of this project is exploring [GKE Sandbox (gVisor)](https://cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods) as an alternative isolation layer. gVisor provides a user-space kernel that intercepts syscalls, offering strong sandbox isolation without Landlock. However, gVisor is currently incompatible with both NIM's CUDA/PyTorch stack (gVisor reports a GPU driver version that NIM considers too old) and NemoClaw's gateway (which binds to 127.0.0.1, causing kubelet health probes to fail under gVisor's network namespace). The manifests include commented-out `runtimeClassName: gvisor` for future re-enablement as these compatibility issues are resolved.
-
 **NemoKube's approach (nemoclaw-start + K8s defense-in-depth):** This repo runs `nemoclaw-start` as the real container entrypoint (PID 1), so the full NemoClaw hardening sequence executes natively: ulimit, PATH locking, config integrity (SHA256 + chattr +i), capability dropping (capsh), and privilege separation (gosu to unprivileged gateway user). K8s layers add defense-in-depth: custom seccomp profile, credential isolation via an inference proxy pod, deny-default NetworkPolicy, and PSA baseline enforcement. The tradeoff is that OpenShell's host-side L7 proxy is replaced by a K8s inference proxy pod, and some OpenShell capabilities (per-binary network rules, hot policy updates, blueprint digest verification) don't have direct K8s equivalents.
 
 ## What This Is
@@ -304,6 +302,7 @@ nemokube/
 │   ├── 06-seccomp-installer.yaml     # DaemonSet: seccomp with Landlock+capsh+gosu
 │   └── 07-inference-proxy.yaml       # Credential isolation proxy
 ├── docs/
+│   ├── NemoKube_v3_PRD.docx          # v3 architecture PRD
 │   ├── NemoKube_v2_PRD.docx          # v2 architecture PRD
 │   ├── NemoClaw_on_CloudRun_Guide.docx
 │   ├── NemoClaw_on_GKE_Guide.docx

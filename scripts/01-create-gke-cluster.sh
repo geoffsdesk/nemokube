@@ -49,13 +49,11 @@ gcloud container node-pools create "${GPU_POOL_NAME}" \
   --min-nodes="${GPU_NODES_MIN}" \
   --max-nodes="${GPU_NODES_MAX}" \
   --node-taints="nvidia.com/gpu=present:NoSchedule" \
-  --node-labels="gpu-type=nvidia-l4" \
-  --sandbox type=gvisor
+  --node-labels="gpu-type=nvidia-l4"
 
-echo "==> Adding sandboxed CPU pool for NemoClaw agent"
+echo "==> Adding CPU pool for NemoClaw sandbox agent"
 
-# Separate CPU pool with gVisor for the NemoClaw sandbox (the default pool
-# doesn't support gVisor — --sandbox is a node-pool-level flag).
+# Separate CPU pool for the NemoClaw sandbox workload.
 gcloud container node-pools create "sandbox-cpu-pool" \
   --project="${PROJECT}" \
   --cluster="${CLUSTER_NAME}" \
@@ -64,8 +62,7 @@ gcloud container node-pools create "sandbox-cpu-pool" \
   --num-nodes=1 \
   --enable-autoscaling \
   --min-nodes=0 \
-  --max-nodes=2 \
-  --sandbox type=gvisor
+  --max-nodes=2
 
 echo "==> Fetching cluster credentials"
 gcloud container clusters get-credentials "${CLUSTER_NAME}" \
